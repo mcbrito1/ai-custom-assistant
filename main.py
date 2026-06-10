@@ -53,34 +53,36 @@ def _send_telegram(chat_id: str, text: str, task_id: str = ""):
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
-DECISION_PROMPT = """Classifique a intenção. Responda APENAS com JSON válido.
+DECISION_PROMPT = """Classifique a intenção em JSON. Responda APENAS com o JSON, nada mais.
 
 Mensagem: {question}
 Data/hora: {now}
 
-RESTRIÇÕES: Só execute ações se houver SINAIS MUITO CLAROS. Default: answer.
+REGRAS:
+1. Se começa com "Adicione", "Coloque", "Acrescente" → obsidian_append
+   EXEMPLOS: "Adicione tomate à lista de compras", "Coloque reunião em tarefas"
+   JSON: {{"action": "obsidian_append", "note": "nome_da_nota", "content": "item", "is_list_item": true}}
 
-1. obsidian_append: APENAS se contém "adicione", "coloque", "acrescente"
-   Formato: "Adicione X à lista de compras"
-   → {{"action": "obsidian_append", "note": "Lista de compras", "content": "X", "is_list_item": true}}
+2. Se começa com "Crie", "Cria uma nota" → obsidian_create
+   EXEMPLOS: "Crie uma nota sobre projetos", "Crie nota de Python"
+   JSON: {{"action": "obsidian_create", "note": "Nome.md", "content": "conteúdo"}}
 
-2. obsidian_create: APENAS se a mensagem começa com "crie" ou "cria uma nota"
-   Formato: "Crie uma nota sobre..."
-   → {{"action": "obsidian_create", "note": "Nome.md", "content": ""}}
+3. Se contém "lembr" + "amanhã" ou "segunda" ou "às" → schedule_once
+   EXEMPLOS: "Me lembre amanhã às 9h", "Lembrete segunda de manhã"
+   JSON: {{"action": "schedule_once", "message": "conteúdo", "run_at": "2026-06-11T09:00"}}
 
-3. schedule_once: APENAS se contém "lembr" + (amanhã|segunda|às XYh)
-   → {{"action": "schedule_once", "message": "...", "run_at": "ISO8601"}}
+4. Se contém "todo dia", "diáriamente", "cada dia" → schedule_recurring
+   EXEMPLOS: "Todo dia às 8h me lembre", "Me lembrar diariamente de exercício"
+   JSON: {{"action": "schedule_recurring", "message": "conteúdo", "cron": "0 8 * * *"}}
 
-4. schedule_recurring: APENAS se contém "todo dia" ou "todo" + "h"
-   → {{"action": "schedule_recurring", "message": "...", "cron": "..."}}
+5. Se é pergunta com "o que", "como", "qual", "quantos", "quando", "por que" → search
+   EXEMPLOS: "O que é Python?", "Como fazer backup?"
+   JSON: {{"action": "search", "query": "termo"}}
 
-5. search: APENAS se é pergunta ("o que", "como", "qual", "quantos")
-   → {{"action": "search", "query": "..."}}
+6. Tudo mais → answer
+   JSON: {{"action": "answer"}}
 
-6. answer: DEFAULT para tudo que não se encaixa acima
-   → {{"action": "answer"}}
-
-Não invente ações. Em dúvida, sempre answer."""
+Responda APENAS com o JSON, nada mais."""
 
 EXTRACT_FACTS_PROMPT = """Analise a conversa e extraia fatos importantes e duradouros sobre o usuário \
 (nome, profissão, projetos, preferências, hábitos, localização, etc).
