@@ -30,7 +30,7 @@ def _run_git(*args) -> tuple[int, str]:
             cwd=str(VAULT),
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=60,
         )
         return result.returncode, (result.stdout + result.stderr).strip()
     except Exception as e:
@@ -151,9 +151,9 @@ def get_note_index() -> str:
 def append_to_note(path: Path, content: str) -> bool:
     """Append content to an existing note, then push."""
     try:
-        existing = path.read_text(encoding="utf-8", errors="ignore")
+        existing = path.read_text(encoding="utf-8", newline="")
         separator = "\n" if existing.endswith("\n") else "\n\n"
-        path.write_text(existing + separator + content, encoding="utf-8")
+        path.write_text(existing + separator + content, encoding="utf-8", newline="")
         log.info(f"Appended to {path.name}: {content[:60]}")
         git_push(f"hermes: append to {path.stem}")
         return True
@@ -174,7 +174,7 @@ def create_note(relative_path: str, content: str) -> Path | None:
         path = Path(str(path) + ".md")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        path.write_text(content, encoding="utf-8", newline="")
         log.info(f"Created note: {path.name}")
         git_push(f"hermes: create {path.stem}")
         return path
@@ -223,10 +223,10 @@ def mark_hermes_done(note_path_str: str, line_number: int):
     """Replace #hermes with #hermes/done on a specific line, then push."""
     path = Path(note_path_str)
     try:
-        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines(keepends=True)
+        lines = path.read_text(encoding="utf-8", newline="").splitlines(keepends=True)
         if 0 <= line_number < len(lines):
             lines[line_number] = lines[line_number].replace(HERMES_TAG, HERMES_DONE_TAG, 1)
-            path.write_text("".join(lines), encoding="utf-8")
+            path.write_text("".join(lines), encoding="utf-8", newline="")
         git_push(f"hermes: mark done in {path.stem}")
     except Exception as e:
         log.error(f"mark_hermes_done failed: {e}")

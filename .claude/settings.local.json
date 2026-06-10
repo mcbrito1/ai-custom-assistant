@@ -1,7 +1,14 @@
 {
   "permissions": {
     "allow": [
-      "Bash(curl -s http://localhost:8000/health)"
+      "Bash(curl -s http://localhost:8000/health)",
+      "Bash(curl -s -X POST http://localhost:8000/obsidian/append -H 'Content-Type: application/json' -d '{ *)",
+      "Bash(docker compose *)",
+      "Bash(docker exec *)",
+      "Bash(pkill -f \"docker logs -f\")",
+      "Bash(curl -s *)",
+      "Bash(git add *)",
+      "Bash(git commit *)"
     ]
   }
 }

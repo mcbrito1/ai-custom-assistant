@@ -53,23 +53,20 @@ def _send_telegram(chat_id: str, text: str, task_id: str = ""):
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
-DECISION_PROMPT = """Analise a mensagem abaixo e classifique a intenção. Responda APENAS com JSON válido.
+DECISION_PROMPT = """Classifique a intenção em JSON. Responda APENAS com o JSON, nada mais.
 
 Mensagem: {question}
-Data/hora atual: {now}
-Notas disponíveis no Obsidian: {note_index}
+Data/hora: {now}
 
-Opções:
-- Busca na internet: {{"action": "search", "query": "<termo>"}}
-- Agendar lembrete único: {{"action": "schedule_once", "message": "<o que lembrar>", "run_at": "<ISO8601 datetime>"}}
-- Agendar recorrente: {{"action": "schedule_recurring", "message": "<o que lembrar>", "cron": "<cron expr 5 campos>"}}
-- Adicionar item a nota existente: {{"action": "obsidian_append", "note": "<nome ou caminho da nota>", "content": "<conteúdo a adicionar>", "is_list_item": true|false}}
-- Criar nova nota: {{"action": "obsidian_create", "note": "<caminho relativo ex: Pasta/Nome.md>", "content": "<conteúdo completo>"}}
-- Responder normalmente: {{"action": "answer"}}
+Padrões de reconhecimento:
+1. "adicione X à Y" ou "adicione X em Y" ou "coloque X em Y" → {{"action": "obsidian_append", "note": "Y", "content": "X", "is_list_item": true}}
+2. "crie uma nota" ou "nova nota sobre" → {{"action": "obsidian_create", "note": "Nome da nota.md", "content": "..."}}
+3. "lembrete para amanhã às XY" ou "me lembre de" → {{"action": "schedule_once", "message": "...", "run_at": "ISO8601"}}
+4. "todo dia às XY" ou "a cada" → {{"action": "schedule_recurring", "message": "...", "cron": "5 campos"}}
+5. "o que é" ou "como" ou "qual é" → {{"action": "search", "query": "..."}}
+6. Qualquer outra coisa → {{"action": "answer"}}
 
-Exemplos de cron: "0 8 * * 1-5" = dias úteis às 8h, "0 9 * * 1" = segunda às 9h.
-Use fuso horário America/Sao_Paulo para calcular horários.
-Para listas de compras, tarefas, afazeres — use obsidian_append com is_list_item: true."""
+Responda APENAS com o JSON, válido e bem formado."""
 
 EXTRACT_FACTS_PROMPT = """Analise a conversa e extraia fatos importantes e duradouros sobre o usuário \
 (nome, profissão, projetos, preferências, hábitos, localização, etc).
@@ -363,8 +360,11 @@ def chat(req: ChatRequest):
             note_index=note_index_short,
         )}],
     )
-    decision = extract_json(decision_resp["message"]["content"])
+    decision_raw = decision_resp["message"]["content"]
+    decision = extract_json(decision_raw)
     action = decision.get("action", "answer")
+    print(f"DEBUG: Intent='{action}' | Raw={decision_raw[:150]}")
+    logging.info(f"Intent classification: action={action}, decision={decision}")
 
     # ── Obsidian write actions ─────────────────────────────────────────────
     if action in ("obsidian_append", "obsidian_create"):

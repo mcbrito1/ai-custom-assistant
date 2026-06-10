@@ -19,6 +19,10 @@ RUN pip install --no-cache-dir \
 # Copy application code
 COPY . .
 
+# Configure git for commits inside container
+RUN git config --global user.email "hermes@localhost" && \
+    git config --global user.name "Hermes Agent"
+
 EXPOSE 8000
 
 CMD ["python", "main.py"]
