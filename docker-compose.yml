@@ -15,16 +15,13 @@ services:
       MEMORY_FILE: /app/data/memory.json
       TASKS_FILE: /app/data/tasks.json
       OBSIDIAN_VAULT: /obsidian
+      HERMES_TAG_SCAN_INTERVAL: ${HERMES_TAG_SCAN_INTERVAL:-60}
       TELEGRAM_TOKEN: ${TELEGRAM_TOKEN}
       TELEGRAM_OWNER_ID: ${TELEGRAM_OWNER_ID}
-      WAHA_URL: ${WAHA_URL:-http://host.docker.internal:3000}
-      WAHA_API_KEY: ${WAHA_API_KEY}
-      WAHA_SESSION: ${WAHA_SESSION:-default}
-      WAHA_MY_NUMBER: ${WAHA_MY_NUMBER}
 
     volumes:
       - ./data:/app/data
-      - C:\Git\Obsidian:/obsidian:ro
+      - C:\Git\Obsidian:/obsidian
 
     ports:
       - "${HERMES_PORT:-8000}:8000"

@@ -25,7 +25,6 @@ def is_owner(update: Update) -> bool:
 # ── Scheduler notification ────────────────────────────────────────────────────
 
 def send_reminder(chat_id: str, text: str, task_id: str):
-    """Called by the scheduler inside hermes container — posts via Telegram Bot API."""
     if _bot_instance is None:
         return
     import asyncio
@@ -36,7 +35,6 @@ def send_reminder(chat_id: str, text: str, task_id: str):
         )
     finally:
         loop.close()
-    # Clean up one-time task from persistence
     try:
         requests.delete(f"{HERMES_BASE}/tasks/{task_id}", timeout=5)
     except Exception:
@@ -110,63 +108,55 @@ async def handle_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = f"Notas para *{query}*:\n\n"
     for r in results:
-        text += f"📄 `{r['file']}`\n{r['excerpt'][:200]}...\n\n"
+        text += f"`{r['file']}`\n{r['excerpt'][:200]}...\n\n"
     if len(text) > 4000:
         text = text[:4000] + "\n...(truncado)"
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
-async def handle_wa(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send a WhatsApp message. Usage: /wa <mensagem> | /wa <numero> <mensagem>"""
+async def handle_obsidian(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all notes or show a specific note. Usage: /obsidian [nome]"""
     if not is_owner(update):
         return
-    args = context.args
-    if not args:
-        await update.message.reply_text("Uso:\n/wa <mensagem>  → envia para você\n/wa <numero> <mensagem>  → envia para outro número")
+    query = " ".join(context.args).strip()
+
+    if not query:
+        resp = requests.get(f"{HERMES_BASE}/obsidian/notes", timeout=10)
+        notes = resp.json().get("notes", [])
+        if not notes:
+            await update.message.reply_text("Vault vazio ou não montado.")
+            return
+        text = f"*{len(notes)} notas no vault:*\n\n" + "\n".join(f"- `{n}`" for n in notes[:50])
+        if len(notes) > 50:
+            text += f"\n... e mais {len(notes) - 50}"
+        await update.message.reply_text(text, parse_mode="Markdown")
         return
 
-    # If first arg looks like a phone number, use it as destination
-    if args[0].lstrip("+").isdigit() and len(args[0]) >= 8:
-        to = args[0]
-        text = " ".join(args[1:])
-    else:
-        to = ""
-        text = " ".join(args)
-
-    if not text:
-        await update.message.reply_text("Informe uma mensagem.")
+    # Search
+    resp = requests.get(f"{HERMES_BASE}/obsidian/search", params={"q": query}, timeout=10)
+    results = resp.json().get("results", [])
+    if not results:
+        await update.message.reply_text(f"Nenhuma nota encontrada para: {query}")
         return
-
-    payload = {"text": text}
-    if to:
-        payload["to"] = to
-
-    try:
-        resp = requests.post(f"{HERMES_BASE}/whatsapp/send", json=payload, timeout=15)
-        result = resp.json()
-        if result.get("ok"):
-            dest = result.get("chat_id", to or "você")
-            await update.message.reply_text(f"✅ WhatsApp enviado para `{dest}`", parse_mode="Markdown")
-        else:
-            await update.message.reply_text(f"❌ Erro: {result.get('error')}")
-    except Exception as e:
-        await update.message.reply_text(f"Erro: {e}")
+    text = f"*Resultados para '{query}':*\n\n"
+    for r in results[:3]:
+        text += f"📄 `{r['file']}` (score: {r['score']})\n{r['excerpt'][:300]}\n\n"
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
-async def handle_wa_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_hermes_tags(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show pending #hermes tags in the vault."""
     if not is_owner(update):
         return
-    try:
-        resp = requests.get(f"{HERMES_BASE}/whatsapp/status", timeout=10)
-        data = resp.json()
-        if data.get("ok"):
-            sessions = data.get("sessions", [])
-            text = f"✅ WAHA conectado\n{len(sessions)} sessão(ões) ativa(s)"
-        else:
-            text = f"❌ WAHA offline: {data.get('error')}"
-    except Exception as e:
-        text = f"Erro ao verificar WAHA: {e}"
-    await update.message.reply_text(text)
+    resp = requests.get(f"{HERMES_BASE}/obsidian/hermes-tags", timeout=10)
+    pending = resp.json().get("pending", [])
+    if not pending:
+        await update.message.reply_text("Nenhuma tag #hermes pendente no vault.")
+        return
+    text = f"*{len(pending)} tag(s) #hermes pendente(s):*\n\n"
+    for t in pending:
+        text += f"`{t['file']}` linha {t['line_number'] + 1}:\n_{t['line_text']}_\n\n"
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def handle_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -232,10 +222,8 @@ if __name__ == "__main__":
         .build()
     )
 
-    # Store bot reference for scheduler callbacks
     _bot_instance = application.bot
 
-    # Register scheduler callback in hermes service
     def _register_callback():
         import time
         time.sleep(5)
@@ -251,9 +239,9 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("memory", handle_memory))
     application.add_handler(CommandHandler("remember", handle_remember))
     application.add_handler(CommandHandler("notes", handle_notes))
+    application.add_handler(CommandHandler("obsidian", handle_obsidian))
+    application.add_handler(CommandHandler("hermestags", handle_hermes_tags))
     application.add_handler(CommandHandler("tasks", handle_tasks))
     application.add_handler(CommandHandler("cancel", handle_cancel))
-    application.add_handler(CommandHandler("wa", handle_wa))
-    application.add_handler(CommandHandler("wastatus", handle_wa_status))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.run_polling()

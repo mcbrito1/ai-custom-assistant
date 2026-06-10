@@ -2,37 +2,41 @@ import os
 import re
 import json
 import logging
+import threading
 import uvicorn
 from collections import deque
 from datetime import datetime
+from pathlib import Path
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
 from pydantic import BaseModel
 import ollama
 from duckduckgo_search import DDGS
 from memory import build_system_prompt, add_fact, get_facts, search_obsidian
+import obsidian
 import scheduler as sched
-import whatsapp as wa
 
 OLLAMA_HOST = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
 MODEL = os.getenv("OLLAMA_MODEL", "llama3")
 HISTORY_SIZE = int(os.getenv("HISTORY_SIZE", "20"))
-
-client = ollama.Client(host=OLLAMA_HOST)
-
-# Per-user conversation history
-_histories: dict[str, deque] = {}
-
-# Telegram notify callback — injected by bot via /internal/set-callback or polling
-_telegram_send = None
-
-
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_OWNER_ID = os.getenv("TELEGRAM_OWNER_ID", "0")
+DEFAULT_CHAT_ID = os.getenv("TELEGRAM_OWNER_ID", "0")
+HERMES_TAG_SCAN_INTERVAL = int(os.getenv("HERMES_TAG_SCAN_INTERVAL", "60"))  # seconds
+
+client = ollama.Client(host=OLLAMA_HOST)
+_histories: dict[str, deque] = {}
 
 
-def _send_telegram(chat_id: str, text: str, task_id: str):
-    """Send a Telegram message directly from the hermes service."""
+def get_history(user_id: str) -> deque:
+    if user_id not in _histories:
+        _histories[user_id] = deque(maxlen=HISTORY_SIZE)
+    return _histories[user_id]
+
+
+# ── Telegram send (from hermes container) ────────────────────────────────────
+
+def _send_telegram(chat_id: str, text: str, task_id: str = ""):
     import httpx
     try:
         httpx.post(
@@ -43,38 +47,29 @@ def _send_telegram(chat_id: str, text: str, task_id: str):
         )
     except Exception as e:
         logging.warning(f"Failed to send Telegram notification: {e}")
-    # Clean up one-time task
-    sched.remove_completed(task_id)
+    if task_id:
+        sched.remove_completed(task_id)
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    sched.set_notify_callback(_send_telegram)
-    sched.start()
-    yield
+# ── Prompts ───────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Hermes Agent", lifespan=lifespan)
-
-
-def get_history(user_id: str) -> deque:
-    if user_id not in _histories:
-        _histories[user_id] = deque(maxlen=HISTORY_SIZE)
-    return _histories[user_id]
-
-
-DECISION_PROMPT = """Analise a mensagem abaixo e classifique a intenção. Responda APENAS com JSON:
+DECISION_PROMPT = """Analise a mensagem abaixo e classifique a intenção. Responda APENAS com JSON válido.
 
 Mensagem: {question}
 Data/hora atual: {now}
+Notas disponíveis no Obsidian: {note_index}
 
 Opções:
 - Busca na internet: {{"action": "search", "query": "<termo>"}}
 - Agendar lembrete único: {{"action": "schedule_once", "message": "<o que lembrar>", "run_at": "<ISO8601 datetime>"}}
 - Agendar recorrente: {{"action": "schedule_recurring", "message": "<o que lembrar>", "cron": "<cron expr 5 campos>"}}
+- Adicionar item a nota existente: {{"action": "obsidian_append", "note": "<nome ou caminho da nota>", "content": "<conteúdo a adicionar>", "is_list_item": true|false}}
+- Criar nova nota: {{"action": "obsidian_create", "note": "<caminho relativo ex: Pasta/Nome.md>", "content": "<conteúdo completo>"}}
 - Responder normalmente: {{"action": "answer"}}
 
-Exemplos de cron: "0 8 * * 1-5" = dias úteis às 8h, "0 9 * * 1" = segunda às 9h, "0 */2 * * *" = a cada 2h.
-Use o fuso horário America/Sao_Paulo para calcular os horários."""
+Exemplos de cron: "0 8 * * 1-5" = dias úteis às 8h, "0 9 * * 1" = segunda às 9h.
+Use fuso horário America/Sao_Paulo para calcular horários.
+Para listas de compras, tarefas, afazeres — use obsidian_append com is_list_item: true."""
 
 EXTRACT_FACTS_PROMPT = """Analise a conversa e extraia fatos importantes e duradouros sobre o usuário \
 (nome, profissão, projetos, preferências, hábitos, localização, etc).
@@ -85,16 +80,26 @@ Se não houver fatos novos: {{"facts": []}}
 Conversa:
 {conversation}"""
 
+HERMES_TAG_PROMPT = """O usuário marcou o seguinte texto com #hermes no seu vault Obsidian, \
+indicando que quer que você tome alguma ação.
 
-def web_search(query: str, max_results: int = 5) -> str:
-    with DDGS() as ddgs:
-        results = list(ddgs.text(query, max_results=max_results))
-    if not results:
-        return "Nenhum resultado encontrado."
-    return "\n\n".join(
-        f"Título: {r['title']}\nResumo: {r['body']}\nFonte: {r['href']}" for r in results
-    )
+Arquivo: {file}
+Texto: {line}
 
+Interprete o que o usuário quer e execute a ação. Responda em JSON com o que deve ser feito:
+{{"action": "answer", "reply": "<resposta/confirmação para enviar ao usuário>"}}
+ou
+{{"action": "obsidian_append", "note": "<nota>", "content": "<conteúdo>", "is_list_item": true|false, "reply": "<confirmação>"}}
+ou
+{{"action": "obsidian_create", "note": "<caminho>", "content": "<conteúdo>", "reply": "<confirmação>"}}
+ou
+{{"action": "schedule_once", "message": "<lembrete>", "run_at": "<ISO8601>", "reply": "<confirmação>"}}
+
+Data/hora atual: {now}
+Notas disponíveis: {note_index}"""
+
+
+# ── LLM helpers ───────────────────────────────────────────────────────────────
 
 def extract_json(text: str) -> dict:
     match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
@@ -104,6 +109,16 @@ def extract_json(text: str) -> dict:
         except Exception:
             pass
     return {}
+
+
+def web_search(query: str, max_results: int = 5) -> str:
+    with DDGS() as ddgs:
+        results = list(ddgs.text(query, max_results=max_results))
+    if not results:
+        return "Nenhum resultado encontrado."
+    return "\n\n".join(
+        f"Título: {r['title']}\nResumo: {r['body']}\nFonte: {r['href']}" for r in results
+    )
 
 
 def extract_and_save_facts(user_id: str):
@@ -127,7 +142,107 @@ def extract_and_save_facts(user_id: str):
         pass
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+# ── Obsidian write actions ────────────────────────────────────────────────────
+
+def execute_obsidian_action(decision: dict) -> tuple[bool, str]:
+    """
+    Execute an obsidian_append or obsidian_create action.
+    Returns (success, reply_text).
+    """
+    action = decision.get("action", "")
+    note_name = decision.get("note", "")
+    content = decision.get("content", "")
+
+    if not note_name or not content:
+        return False, "Não entendi qual nota ou conteúdo modificar."
+
+    if action == "obsidian_append":
+        path = obsidian.find_note(note_name)
+        if not path:
+            return False, f"Nota '{note_name}' não encontrada no vault."
+        is_list = decision.get("is_list_item", False)
+        if is_list:
+            ok = obsidian.append_list_item(path, content)
+        else:
+            ok = obsidian.append_to_note(path, content)
+        if ok:
+            return True, f"✅ Adicionado à nota *{path.stem}*:\n`{content}`"
+        return False, "Falha ao escrever na nota."
+
+    elif action == "obsidian_create":
+        path = obsidian.create_note(note_name, content)
+        if path:
+            return True, f"✅ Nota criada: *{path.stem}*"
+        return False, "Falha ao criar nota."
+
+    return False, "Ação desconhecida."
+
+
+# ── #hermes tag scanner ───────────────────────────────────────────────────────
+
+def _process_hermes_tags():
+    """Background thread: scan vault for #hermes tags and process them."""
+    import time
+    while True:
+        time.sleep(HERMES_TAG_SCAN_INTERVAL)
+        try:
+            pending = obsidian.scan_hermes_tags()
+            if not pending:
+                continue
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
+            note_index = obsidian.get_note_index()
+            for tag in pending:
+                try:
+                    prompt = HERMES_TAG_PROMPT.format(
+                        file=tag["file"],
+                        line=tag["line_text"],
+                        now=now_str,
+                        note_index=note_index,
+                    )
+                    resp = client.chat(
+                        model=MODEL,
+                        messages=[{"role": "user", "content": prompt}],
+                    )
+                    decision = extract_json(resp["message"]["content"])
+                    reply = decision.pop("reply", f"Processado: {tag['line_text'][:60]}")
+
+                    if decision.get("action") in ("obsidian_append", "obsidian_create"):
+                        execute_obsidian_action(decision)
+                    elif decision.get("action") == "schedule_once":
+                        try:
+                            run_at = datetime.fromisoformat(decision["run_at"])
+                            sched.add_once(decision["message"], DEFAULT_CHAT_ID, run_at)
+                        except Exception as e:
+                            reply = f"Erro ao agendar: {e}"
+
+                    # Mark as done in the note
+                    obsidian.mark_hermes_done(tag["path"], tag["line_number"])
+
+                    # Notify user via Telegram
+                    _send_telegram(
+                        DEFAULT_CHAT_ID,
+                        f"📝 *#hermes* em `{tag['file']}`:\n{reply}",
+                    )
+                except Exception as e:
+                    logging.warning(f"hermes tag processing failed for {tag['file']}: {e}")
+        except Exception as e:
+            logging.warning(f"hermes tag scan error: {e}")
+
+
+# ── Lifespan ──────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    sched.set_notify_callback(_send_telegram)
+    sched.start()
+    threading.Thread(target=_process_hermes_tags, daemon=True).start()
+    yield
+
+
+app = FastAPI(title="Hermes Agent", lifespan=lifespan)
+
+
+# ── Request models ────────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
     message: str
@@ -138,9 +253,22 @@ class ChatRequest(BaseModel):
 class ScheduleRequest(BaseModel):
     message: str
     chat_id: str
-    run_at: str | None = None   # ISO8601 for once
-    cron: str | None = None     # cron expr for recurring
+    run_at: str | None = None
+    cron: str | None = None
 
+
+class ObsidianWriteRequest(BaseModel):
+    note: str
+    content: str
+    is_list_item: bool = False
+
+
+class ObsidianCreateRequest(BaseModel):
+    path: str
+    content: str
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
@@ -162,24 +290,37 @@ def memory_add(body: dict):
 
 @app.get("/obsidian/search")
 def obsidian_search(q: str = ""):
-    hits = search_obsidian(q) if q else []
+    hits = obsidian.search_notes(q) if q else []
     return {"results": hits}
 
 
-@app.get("/whatsapp/status")
-def whatsapp_status():
-    return wa.check_status()
+@app.get("/obsidian/notes")
+def obsidian_notes():
+    notes = [str(p.relative_to(obsidian.VAULT)) for p in obsidian._all_notes()]
+    return {"notes": sorted(notes)}
 
 
-@app.post("/whatsapp/send")
-def whatsapp_send(body: dict):
-    to = body.get("to", "")
-    text = body.get("text", "")
-    if not text:
-        return {"ok": False, "error": "text is required"}
-    if to:
-        return wa.send_text(to, text)
-    return wa.send_to_owner(text)
+@app.post("/obsidian/append")
+def obsidian_append(req: ObsidianWriteRequest):
+    path = obsidian.find_note(req.note)
+    if not path:
+        return {"ok": False, "error": f"Nota '{req.note}' não encontrada."}
+    if req.is_list_item:
+        ok = obsidian.append_list_item(path, req.content)
+    else:
+        ok = obsidian.append_to_note(path, req.content)
+    return {"ok": ok, "file": str(path.relative_to(obsidian.VAULT))}
+
+
+@app.post("/obsidian/create")
+def obsidian_create(req: ObsidianCreateRequest):
+    path = obsidian.create_note(req.path, req.content)
+    return {"ok": path is not None, "file": str(path.relative_to(obsidian.VAULT)) if path else None}
+
+
+@app.get("/obsidian/hermes-tags")
+def obsidian_hermes_tags():
+    return {"pending": obsidian.scan_hermes_tags()}
 
 
 @app.get("/tasks")
@@ -209,16 +350,28 @@ def tasks_cancel(task_id: str):
 def chat(req: ChatRequest):
     history = get_history(req.user_id)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
+    note_index_short = "\n".join(
+        str(p.relative_to(obsidian.VAULT)) for p in obsidian._all_notes()
+    )[:1500]
 
     # Classify intent
     decision_resp = client.chat(
         model=MODEL,
         messages=[{"role": "user", "content": DECISION_PROMPT.format(
-            question=req.message, now=now_str
+            question=req.message,
+            now=now_str,
+            note_index=note_index_short,
         )}],
     )
     decision = extract_json(decision_resp["message"]["content"])
     action = decision.get("action", "answer")
+
+    # ── Obsidian write actions ─────────────────────────────────────────────
+    if action in ("obsidian_append", "obsidian_create"):
+        ok, reply = execute_obsidian_action(decision)
+        history.append({"role": "user", "content": req.message})
+        history.append({"role": "assistant", "content": reply})
+        return {"reply": reply, "action": action, "ok": ok}
 
     # ── Schedule once ──────────────────────────────────────────────────────
     if action == "schedule_once" and decision.get("run_at"):
@@ -252,7 +405,7 @@ def chat(req: ChatRequest):
         searched = True
 
     # ── Normal answer ──────────────────────────────────────────────────────
-    obsidian_hits = search_obsidian(req.message)
+    obsidian_hits = obsidian.search_notes(req.message)
     obsidian_context = "\n\n".join(
         f"[{h['file']}]\n{h['excerpt']}" for h in obsidian_hits
     ) if obsidian_hits else ""
