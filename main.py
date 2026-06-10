@@ -57,16 +57,23 @@ DECISION_PROMPT = """Classifique a intenção em JSON. Responda APENAS com o JSO
 
 Mensagem: {question}
 Data/hora: {now}
+Notas no vault: {note_index}
 
 Padrões de reconhecimento:
-1. "adicione X à Y" ou "adicione X em Y" ou "coloque X em Y" → {{"action": "obsidian_append", "note": "Y", "content": "X", "is_list_item": true}}
-2. "crie uma nota" ou "nova nota sobre" → {{"action": "obsidian_create", "note": "Nome da nota.md", "content": "..."}}
-3. "lembrete para amanhã às XY" ou "me lembre de" → {{"action": "schedule_once", "message": "...", "run_at": "ISO8601"}}
-4. "todo dia às XY" ou "a cada" → {{"action": "schedule_recurring", "message": "...", "cron": "5 campos"}}
-5. "o que é" ou "como" ou "qual é" → {{"action": "search", "query": "..."}}
-6. Qualquer outra coisa → {{"action": "answer"}}
+1. "adicione/coloque/adiciona X à/em Y" (escrever em nota existente)
+   - Use o nome EXATO da nota disponível acima (procure por palavras-chave)
+   - → {{"action": "obsidian_append", "note": "Nome Exato da Nota.md", "content": "X", "is_list_item": true}}
+2. "crie/cria uma nota sobre Y" (criar nova nota)
+   - → {{"action": "obsidian_create", "note": "Pasta/Nome da Nota.md", "content": "conteúdo inicial"}}
+3. "lembrete/me lembre de X amanhã/segunda/às 10h" (agenda uma vez)
+   - → {{"action": "schedule_once", "message": "X", "run_at": "2026-06-11T10:00:00"}}
+4. "todo dia/semana/mês às XY me lembrar de Y" (agenda recorrente)
+   - → {{"action": "schedule_recurring", "message": "Y", "cron": "0 10 * * *"}}
+5. "o que/como/qual/quanto/quando" (buscar na web)
+   - → {{"action": "search", "query": "termo de busca"}}
+6. Outra coisa qualquer → {{"action": "answer"}}
 
-Responda APENAS com o JSON, válido e bem formado."""
+Responda APENAS com JSON válido. Se não encontrar a nota exata, tente aproximações (compra→Lista de compras)."""
 
 EXTRACT_FACTS_PROMPT = """Analise a conversa e extraia fatos importantes e duradouros sobre o usuário \
 (nome, profissão, projetos, preferências, hábitos, localização, etc).
@@ -154,7 +161,9 @@ def execute_obsidian_action(decision: dict) -> tuple[bool, str]:
         return False, "Não entendi qual nota ou conteúdo modificar."
 
     if action == "obsidian_append":
-        path = obsidian.find_note(note_name)
+        # Remover .md do final se existir
+        search_name = note_name.replace(".md", "").strip()
+        path = obsidian.find_note(search_name)
         if not path:
             return False, f"Nota '{note_name}' não encontrada no vault."
         is_list = decision.get("is_list_item", False)
@@ -167,7 +176,9 @@ def execute_obsidian_action(decision: dict) -> tuple[bool, str]:
         return False, "Falha ao escrever na nota."
 
     elif action == "obsidian_create":
-        path = obsidian.create_note(note_name, content)
+        # Garantir que tenha .md se não tiver
+        create_path = note_name if note_name.endswith(".md") else f"{note_name}.md"
+        path = obsidian.create_note(create_path, content)
         if path:
             return True, f"✅ Nota criada: *{path.stem}*"
         return False, "Falha ao criar nota."
@@ -363,8 +374,6 @@ def chat(req: ChatRequest):
     decision_raw = decision_resp["message"]["content"]
     decision = extract_json(decision_raw)
     action = decision.get("action", "answer")
-    print(f"DEBUG: Intent='{action}' | Raw={decision_raw[:150]}")
-    logging.info(f"Intent classification: action={action}, decision={decision}")
 
     # ── Obsidian write actions ─────────────────────────────────────────────
     if action in ("obsidian_append", "obsidian_create"):

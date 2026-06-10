@@ -8,7 +8,9 @@
       "Bash(pkill -f \"docker logs -f\")",
       "Bash(curl -s *)",
       "Bash(git add *)",
-      "Bash(git commit *)"
+      "Bash(git commit *)",
+      "PowerShell(docker cp 'C:\\\\Temp\\\\test_find.py' hermes-agent:/tmp/test_find.py)",
+      "PowerShell(docker exec hermes-agent python3 /tmp/test_find.py)"
     ]
   }
 }

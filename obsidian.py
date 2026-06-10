@@ -124,9 +124,16 @@ def find_note(name: str) -> Path | None:
     best: tuple[int, Path | None] = (0, None)
     for path in _all_notes():
         stem = path.stem.lower()
+        # Exact match on filename
         if stem == name_lower:
             return path
-        score = sum(1 for w in name_lower.split() if w in stem)
+        # Match all words in name against the stem
+        name_words = name_lower.split()
+        stem_words = stem.split()
+        score = sum(1 for w in name_words if any(sw.startswith(w) or w in sw for sw in stem_words))
+        # Also score by substring match
+        if name_lower in stem:
+            score += 5
         if score > best[0]:
             best = (score, path)
     return best[1] if best[0] > 0 else None
@@ -151,9 +158,11 @@ def get_note_index() -> str:
 def append_to_note(path: Path, content: str) -> bool:
     """Append content to an existing note, then push."""
     try:
-        existing = path.read_text(encoding="utf-8", newline="")
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            existing = f.read()
         separator = "\n" if existing.endswith("\n") else "\n\n"
-        path.write_text(existing + separator + content, encoding="utf-8", newline="")
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(existing + separator + content)
         log.info(f"Appended to {path.name}: {content[:60]}")
         git_push(f"hermes: append to {path.stem}")
         return True
@@ -174,7 +183,8 @@ def create_note(relative_path: str, content: str) -> Path | None:
         path = Path(str(path) + ".md")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8", newline="")
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(content)
         log.info(f"Created note: {path.name}")
         git_push(f"hermes: create {path.stem}")
         return path
@@ -186,7 +196,8 @@ def create_note(relative_path: str, content: str) -> Path | None:
 def update_note_content(path: Path, new_content: str) -> bool:
     """Overwrite the full content of a note, then push."""
     try:
-        path.write_text(new_content, encoding="utf-8")
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(new_content)
         git_push(f"hermes: update {path.stem}")
         return True
     except Exception as e:
@@ -223,10 +234,12 @@ def mark_hermes_done(note_path_str: str, line_number: int):
     """Replace #hermes with #hermes/done on a specific line, then push."""
     path = Path(note_path_str)
     try:
-        lines = path.read_text(encoding="utf-8", newline="").splitlines(keepends=True)
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            lines = f.readlines()
         if 0 <= line_number < len(lines):
             lines[line_number] = lines[line_number].replace(HERMES_TAG, HERMES_DONE_TAG, 1)
-            path.write_text("".join(lines), encoding="utf-8", newline="")
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.writelines(lines)
         git_push(f"hermes: mark done in {path.stem}")
     except Exception as e:
         log.error(f"mark_hermes_done failed: {e}")
