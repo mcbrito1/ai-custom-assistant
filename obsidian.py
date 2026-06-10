@@ -118,24 +118,35 @@ def search_notes(query: str, max_results: int = 5) -> list[dict]:
 
 
 def find_note(name: str) -> Path | None:
-    """Find a note by approximate name match (case-insensitive). Pulls first."""
+    """Find a note by approximate name match (case-insensitive, underscore/space agnostic)."""
     git_pull()
-    name_lower = name.lower().replace(".md", "")
+    name_lower = name.lower().replace(".md", "").strip()
+    # Normalize: replace underscores, hyphens with spaces for matching
+    name_normalized = name_lower.replace("_", " ").replace("-", " ")
     best: tuple[int, Path | None] = (0, None)
+
     for path in _all_notes():
         stem = path.stem.lower()
-        # Exact match on filename
-        if stem == name_lower:
+        stem_normalized = stem.replace("_", " ").replace("-", " ")
+
+        # Exact match (case-insensitive)
+        if stem == name_lower or stem_normalized == name_normalized:
             return path
-        # Match all words in name against the stem
-        name_words = name_lower.split()
-        stem_words = stem.split()
+
+        # Score based on word matches
+        name_words = name_normalized.split()
+        stem_words = stem_normalized.split()
         score = sum(1 for w in name_words if any(sw.startswith(w) or w in sw for sw in stem_words))
-        # Also score by substring match
-        if name_lower in stem:
+
+        # Bonus for substring match
+        if name_normalized in stem_normalized:
             score += 5
+        if name_lower in stem:
+            score += 3
+
         if score > best[0]:
             best = (score, path)
+
     return best[1] if best[0] > 0 else None
 
 
