@@ -53,27 +53,34 @@ def _send_telegram(chat_id: str, text: str, task_id: str = ""):
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
-DECISION_PROMPT = """Classifique a intenção em JSON. Responda APENAS com o JSON, nada mais.
+DECISION_PROMPT = """Classifique a intenção. Responda APENAS com JSON válido.
 
 Mensagem: {question}
 Data/hora: {now}
-Notas no vault: {note_index}
 
-Padrões de reconhecimento:
-1. "adicione/coloque/adiciona X à/em Y" (escrever em nota existente)
-   - Use o nome EXATO da nota disponível acima (procure por palavras-chave)
-   - → {{"action": "obsidian_append", "note": "Nome Exato da Nota.md", "content": "X", "is_list_item": true}}
-2. "crie/cria uma nota sobre Y" (criar nova nota)
-   - → {{"action": "obsidian_create", "note": "Pasta/Nome da Nota.md", "content": "conteúdo inicial"}}
-3. "lembrete/me lembre de X amanhã/segunda/às 10h" (agenda uma vez)
-   - → {{"action": "schedule_once", "message": "X", "run_at": "2026-06-11T10:00:00"}}
-4. "todo dia/semana/mês às XY me lembrar de Y" (agenda recorrente)
-   - → {{"action": "schedule_recurring", "message": "Y", "cron": "0 10 * * *"}}
-5. "o que/como/qual/quanto/quando" (buscar na web)
-   - → {{"action": "search", "query": "termo de busca"}}
-6. Outra coisa qualquer → {{"action": "answer"}}
+RESTRIÇÕES: Só execute ações se houver SINAIS MUITO CLAROS. Default: answer.
 
-Responda APENAS com JSON válido. Se não encontrar a nota exata, tente aproximações (compra→Lista de compras)."""
+1. obsidian_append: APENAS se contém "adicione", "coloque", "acrescente"
+   Formato: "Adicione X à lista de compras"
+   → {{"action": "obsidian_append", "note": "Lista de compras", "content": "X", "is_list_item": true}}
+
+2. obsidian_create: APENAS se a mensagem começa com "crie" ou "cria uma nota"
+   Formato: "Crie uma nota sobre..."
+   → {{"action": "obsidian_create", "note": "Nome.md", "content": ""}}
+
+3. schedule_once: APENAS se contém "lembr" + (amanhã|segunda|às XYh)
+   → {{"action": "schedule_once", "message": "...", "run_at": "ISO8601"}}
+
+4. schedule_recurring: APENAS se contém "todo dia" ou "todo" + "h"
+   → {{"action": "schedule_recurring", "message": "...", "cron": "..."}}
+
+5. search: APENAS se é pergunta ("o que", "como", "qual", "quantos")
+   → {{"action": "search", "query": "..."}}
+
+6. answer: DEFAULT para tudo que não se encaixa acima
+   → {{"action": "answer"}}
+
+Não invente ações. Em dúvida, sempre answer."""
 
 EXTRACT_FACTS_PROMPT = """Analise a conversa e extraia fatos importantes e duradouros sobre o usuário \
 (nome, profissão, projetos, preferências, hábitos, localização, etc).
