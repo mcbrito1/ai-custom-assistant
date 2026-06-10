@@ -1,0 +1,70 @@
+services:
+  hermes:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hermes-agent
+    restart: unless-stopped
+
+    environment:
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      OLLAMA_HOST: http://host.docker.internal:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma2:2b}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      PYTHONUNBUFFERED: "1"
+      MEMORY_FILE: /app/data/memory.json
+      TASKS_FILE: /app/data/tasks.json
+      OBSIDIAN_VAULT: /obsidian
+      TELEGRAM_TOKEN: ${TELEGRAM_TOKEN}
+      TELEGRAM_OWNER_ID: ${TELEGRAM_OWNER_ID}
+      WAHA_URL: ${WAHA_URL:-http://host.docker.internal:3000}
+      WAHA_API_KEY: ${WAHA_API_KEY}
+      WAHA_SESSION: ${WAHA_SESSION:-default}
+      WAHA_MY_NUMBER: ${WAHA_MY_NUMBER}
+
+    volumes:
+      - ./data:/app/data
+      - C:\Git\Obsidian:/obsidian:ro
+
+    ports:
+      - "${HERMES_PORT:-8000}:8000"
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    networks:
+      - hermes-net
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  hermes-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hermes-bot
+    restart: unless-stopped
+    command: ["python", "bot.py"]
+
+    environment:
+      TELEGRAM_TOKEN: ${TELEGRAM_TOKEN}
+      TELEGRAM_OWNER_ID: ${TELEGRAM_OWNER_ID}
+      HOST_AGENT_URL: ${HOST_AGENT_URL:-http://host.docker.internal:9000/exec}
+      HOST_AGENT_SECRET: ${HOST_AGENT_SECRET}
+      HERMES_URL: http://hermes:8000/chat
+      PYTHONUNBUFFERED: "1"
+
+    depends_on:
+      hermes:
+        condition: service_healthy
+
+    networks:
+      - hermes-net
+
+networks:
+  hermes-net:
+    driver: bridge
