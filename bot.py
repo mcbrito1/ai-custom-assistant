@@ -199,13 +199,18 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         resp = requests.get(f"{HERMES_BASE}/status", timeout=10)
         data = resp.json()
         vi = data.get("vault_index", {})
+        models = data.get("models", {})
+        model_lines = "\n".join(f"  · {k}: `{v}`" for k, v in models.items())
+        uptime = data.get("uptime_seconds", 0)
+        uptime_str = f"{uptime // 3600}h {(uptime % 3600) // 60}m"
         text = (
             f"*Status do Hermes*\n\n"
-            f"🧠 Modelo: `{data.get('model','?')}`\n"
+            f"🧠 Modelos:\n{model_lines}\n\n"
             f"📚 Notas indexadas: `{vi.get('indexed_notes','?')}` "
             f"({'semântico' if vi.get('available') else 'keyword fallback'})\n"
             f"📅 Tarefas agendadas: `{data.get('scheduled_tasks','?')}`\n"
-            f"🧬 Fatos na memória: `{data.get('memory_facts','?')}`"
+            f"🧬 Fatos na memória: `{data.get('memory_facts','?')}`\n"
+            f"⏱ Uptime: `{uptime_str}`"
         )
     except Exception as e:
         text = f"Erro ao obter status: {e}"
@@ -392,12 +397,13 @@ async def handle_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         results["hermes_api"] = ("❌", str(e)[:60])
 
-    # 2. Ollama / LLM
+    # 2. Ollama / LLM models
     try:
         r = requests.get(f"{HERMES_BASE}/status", timeout=10)
         data = r.json()
-        model = data.get("model", "?")
-        results["ollama"] = ("✅", f"modelo `{model}` acessível")
+        models = data.get("models", {})
+        model_lines = " | ".join(f"{k}:`{v}`" for k, v in models.items())
+        results["ollama"] = ("✅", model_lines)
     except Exception as e:
         results["ollama"] = ("❌", str(e)[:60])
 
