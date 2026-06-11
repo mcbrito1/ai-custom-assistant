@@ -12,29 +12,78 @@ from contextlib import asynccontextmanager
 from pydantic import BaseModel
 import ollama
 from duckduckgo_search import DDGS
-from memory import build_system_prompt, add_fact, get_facts, search_obsidian
+from memory import build_system_prompt, add_fact, get_facts, search_obsidian, update_profile
 import obsidian
+import vault_index
 import scheduler as sched
+import activity
 
 OLLAMA_HOST = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
-MODEL = os.getenv("OLLAMA_MODEL", "llama3")
+MODEL = os.getenv("OLLAMA_MODEL", "gemma2:2b")
 HISTORY_SIZE = int(os.getenv("HISTORY_SIZE", "20"))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_OWNER_ID = os.getenv("TELEGRAM_OWNER_ID", "0")
 DEFAULT_CHAT_ID = os.getenv("TELEGRAM_OWNER_ID", "0")
-HERMES_TAG_SCAN_INTERVAL = int(os.getenv("HERMES_TAG_SCAN_INTERVAL", "60"))  # seconds
+HERMES_TAG_SCAN_INTERVAL = int(os.getenv("HERMES_TAG_SCAN_INTERVAL", "60"))
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+HISTORY_FILE = os.getenv("HISTORY_FILE", "/app/data/history.json")
+MORNING_BRIEFING_CRON = os.getenv("MORNING_BRIEFING_CRON", "0 8 * * *")
+BACKUP_CRON = os.getenv("BACKUP_CRON", "0 3 * * 0")  # Sundays at 3am
+PROJECT_SCAN_INTERVAL = int(os.getenv("PROJECT_SCAN_INTERVAL", "3600"))  # seconds
+PROJECT_STALE_DAYS = int(os.getenv("PROJECT_STALE_DAYS", "7"))
+MAX_IMPROVE_ITERATIONS = int(os.getenv("MAX_IMPROVE_ITERATIONS", "2"))
+RETRY_ATTEMPTS = int(os.getenv("RETRY_ATTEMPTS", "3"))
+RETRY_BACKOFF = float(os.getenv("RETRY_BACKOFF", "2.0"))
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("hermes")
 
 client = ollama.Client(host=OLLAMA_HOST)
 _histories: dict[str, deque] = {}
+_HISTORY_LOCK = threading.Lock()
+
+
+# ── Conversation history persistence ─────────────────────────────────────────
+
+def _load_histories():
+    path = Path(HISTORY_FILE)
+    if not path.exists():
+        return
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        with _HISTORY_LOCK:
+            for uid, msgs in raw.items():
+                d = deque(maxlen=HISTORY_SIZE)
+                d.extend(msgs[-HISTORY_SIZE:])
+                _histories[uid] = d
+        log.info(f"Loaded conversation history for {len(raw)} user(s).")
+    except Exception as e:
+        log.warning(f"Could not load history: {e}")
+
+
+def _save_histories():
+    path = Path(HISTORY_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with _HISTORY_LOCK:
+            data = {uid: list(msgs) for uid, msgs in _histories.items()}
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        log.warning(f"Could not save history: {e}")
 
 
 def get_history(user_id: str) -> deque:
-    if user_id not in _histories:
-        _histories[user_id] = deque(maxlen=HISTORY_SIZE)
-    return _histories[user_id]
+    with _HISTORY_LOCK:
+        if user_id not in _histories:
+            _histories[user_id] = deque(maxlen=HISTORY_SIZE)
+        return _histories[user_id]
 
 
-# ── Telegram send (from hermes container) ────────────────────────────────────
+# ── Telegram send ─────────────────────────────────────────────────────────────
 
 def _send_telegram(chat_id: str, text: str, task_id: str = ""):
     import httpx
@@ -46,70 +95,113 @@ def _send_telegram(chat_id: str, text: str, task_id: str = ""):
             timeout=10,
         )
     except Exception as e:
-        logging.warning(f"Failed to send Telegram notification: {e}")
+        log.warning(f"Failed to send Telegram notification: {e}")
     if task_id:
         sched.remove_completed(task_id)
 
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
-DECISION_PROMPT = """Classifique a intenção em JSON. Responda APENAS com o JSON, nada mais.
+# Kept short and directive for gemma2:2b. Few-shot examples drive reliable JSON output.
+DECISION_PROMPT = """Classifique a mensagem e retorne APENAS um JSON válido, sem explicações.
 
-Mensagem: {question}
+Mensagem: "{question}"
 Data/hora: {now}
 
+EXEMPLOS:
+"Adicione leite à lista de compras" → {{"action":"obsidian_append","note":"lista de compras","content":"leite","is_list_item":true}}
+"Crie uma nota de ideias" → {{"action":"obsidian_create","note":"Ideias.md","content":"# Ideias\n"}}
+"O que está na minha nota de projetos?" → {{"action":"obsidian_read","note":"projetos"}}
+"Atualize minha nota de reunião para incluir as decisões de hoje" → {{"action":"obsidian_update","note":"reunião","content":"## Decisões\n- ..."}}
+"Me lembre amanhã às 9h de ligar para o médico" → {{"action":"schedule_once","message":"Ligar para o médico","run_at":"2026-06-12T09:00"}}
+"Me lembre todo dia às 7h de tomar água" → {{"action":"schedule_recurring","message":"Tomar água","cron":"0 7 * * *"}}
+"Refatora o arquivo main.py" → {{"action":"delegate_claude","task":"Refatora o arquivo main.py"}}
+"Cria um script Python para renomear arquivos" → {{"action":"delegate_claude","task":"Cria um script Python para renomear arquivos"}}
+"O que é Docker?" → {{"action":"search","query":"O que é Docker"}}
+"Olá, como vai?" → {{"action":"answer"}}
+
 REGRAS:
-1. Se começa com "Adicione", "Coloque", "Acrescente" → obsidian_append
-   EXEMPLOS: "Adicione tomate à lista de compras", "Coloque reunião em tarefas"
-   JSON: {{"action": "obsidian_append", "note": "nome_da_nota", "content": "item", "is_list_item": true}}
+- obsidian_append: adicionar item/texto a nota existente
+- obsidian_create: criar nota nova
+- obsidian_read: ler/mostrar conteúdo de uma nota
+- obsidian_update: sobrescrever/editar conteúdo de nota existente
+- schedule_once: lembrete com data/hora específica
+- schedule_recurring: lembrete que se repete (todo dia, toda semana)
+- delegate_claude: qualquer tarefa técnica (código, scripts, análise de projetos, refatoração)
+- search: perguntas factuais sobre o mundo
+- answer: conversa geral
 
-2. Se começa com "Crie", "Cria uma nota" → obsidian_create
-   EXEMPLOS: "Crie uma nota sobre projetos", "Crie nota de Python"
-   JSON: {{"action": "obsidian_create", "note": "Nome.md", "content": "conteúdo"}}
+Retorne APENAS o JSON."""
 
-3. Se contém "lembr" + "amanhã" ou "segunda" ou "às" → schedule_once
-   EXEMPLOS: "Me lembre amanhã às 9h", "Lembrete segunda de manhã"
-   JSON: {{"action": "schedule_once", "message": "conteúdo", "run_at": "2026-06-11T09:00"}}
-
-4. Se contém "todo dia", "diáriamente", "cada dia" → schedule_recurring
-   EXEMPLOS: "Todo dia às 8h me lembre", "Me lembrar diariamente de exercício"
-   JSON: {{"action": "schedule_recurring", "message": "conteúdo", "cron": "0 8 * * *"}}
-
-5. Se é pergunta com "o que", "como", "qual", "quantos", "quando", "por que" → search
-   EXEMPLOS: "O que é Python?", "Como fazer backup?"
-   JSON: {{"action": "search", "query": "termo"}}
-
-6. Tudo mais → answer
-   JSON: {{"action": "answer"}}
-
-Responda APENAS com o JSON, nada mais."""
-
-EXTRACT_FACTS_PROMPT = """Analise a conversa e extraia fatos importantes e duradouros sobre o usuário \
-(nome, profissão, projetos, preferências, hábitos, localização, etc).
-
+EXTRACT_FACTS_PROMPT = """Extraia fatos duradouros sobre o usuário desta conversa (nome, profissão, projetos, hábitos).
 Retorne APENAS JSON: {{"facts": ["fato 1", "fato 2"]}}
 Se não houver fatos novos: {{"facts": []}}
 
 Conversa:
 {conversation}"""
 
-HERMES_TAG_PROMPT = """O usuário marcou o seguinte texto com #hermes no seu vault Obsidian, \
-indicando que quer que você tome alguma ação.
+MORNING_BRIEFING_PROMPT = """Você é o Hermes. Prepare um briefing matinal conciso para o usuário.
+
+Data/hora: {now}
+Tarefas agendadas para hoje: {tasks}
+Resumo do vault Obsidian: {vault_summary}
+
+Escreva um briefing em português com:
+1. Saudação breve
+2. Tarefas do dia (se houver)
+3. Destaques do vault relevantes para hoje
+4. Uma sugestão proativa (se houver algo parado ou importante)
+
+Seja direto e útil. Máximo 300 palavras."""
+
+REFLECT_PROMPT = """Você é o Hermes. Analise o vault Obsidian do usuário e gere insights.
+
+Índice do vault:
+{vault_index}
+
+Projetos identificados (notas com #projeto):
+{projects}
+
+Tarefas agendadas: {tasks}
+
+Gere um relatório de reflexão em português com:
+1. Resumo geral do vault (quantas notas, temas principais)
+2. Projetos em andamento vs parados (sem progresso recente)
+3. Sugestões de próximas ações
+4. Itens que poderiam ser delegados ao Claude Code
+
+Seja analítico e objetivo. Máximo 400 palavras."""
+
+IMPROVE_PROJECT_PROMPT = """Você é um assistente de desenvolvimento. Analise esta nota de projeto e execute melhorias.
+
+Nome do projeto: {note_name}
+Conteúdo atual:
+{content}
+
+Iteração {iteration} de {max_iterations}.
+Resultados anteriores: {previous_results}
+
+Sua tarefa:
+1. Identifique os requisitos e itens em aberto (- [ ])
+2. Para cada item em aberto, implemente ou elabore a solução
+3. Se envolver código, escreva o código completo e funcional
+4. Marque os itens implementados como concluídos (- [x])
+5. Adicione uma seção "## Implementação {date}" com o que foi feito
+
+Responda com o resultado completo da implementação."""
+
+HERMES_TAG_PROMPT = """Texto marcado com #hermes no Obsidian do usuário. Execute a ação indicada.
 
 Arquivo: {file}
 Texto: {line}
+Data/hora: {now}
+Notas disponíveis: {note_index}
 
-Interprete o que o usuário quer e execute a ação. Responda em JSON com o que deve ser feito:
-{{"action": "answer", "reply": "<resposta/confirmação para enviar ao usuário>"}}
-ou
-{{"action": "obsidian_append", "note": "<nota>", "content": "<conteúdo>", "is_list_item": true|false, "reply": "<confirmação>"}}
-ou
-{{"action": "obsidian_create", "note": "<caminho>", "content": "<conteúdo>", "reply": "<confirmação>"}}
-ou
-{{"action": "schedule_once", "message": "<lembrete>", "run_at": "<ISO8601>", "reply": "<confirmação>"}}
-
-Data/hora atual: {now}
-Notas disponíveis: {note_index}"""
+Retorne APENAS JSON com a ação e confirmação:
+{{"action":"answer","reply":"mensagem ao usuário"}}
+{{"action":"obsidian_append","note":"nome","content":"texto","is_list_item":true,"reply":"confirmação"}}
+{{"action":"obsidian_create","note":"caminho.md","content":"conteúdo","reply":"confirmação"}}
+{{"action":"schedule_once","message":"lembrete","run_at":"ISO8601","reply":"confirmação"}}"""
 
 
 # ── LLM helpers ───────────────────────────────────────────────────────────────
@@ -122,6 +214,13 @@ def extract_json(text: str) -> dict:
         except Exception:
             pass
     return {}
+
+
+def _validate_cron(expr: str) -> bool:
+    parts = expr.strip().split()
+    if len(parts) != 5:
+        return False
+    return all(re.match(r'^[\d\*\/\-,]+$', p) for p in parts)
 
 
 def web_search(query: str, max_results: int = 5) -> str:
@@ -151,17 +250,13 @@ def extract_and_save_facts(user_id: str):
         for fact in data.get("facts", []):
             if fact and len(fact) > 5:
                 add_fact(fact)
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning(f"Fact extraction failed: {e}")
 
 
 # ── Obsidian write actions ────────────────────────────────────────────────────
 
 def execute_obsidian_action(decision: dict) -> tuple[bool, str]:
-    """
-    Execute an obsidian_append or obsidian_create action.
-    Returns (success, reply_text).
-    """
     action = decision.get("action", "")
     note_name = decision.get("note", "")
     content = decision.get("content", "")
@@ -170,22 +265,17 @@ def execute_obsidian_action(decision: dict) -> tuple[bool, str]:
         return False, "Não entendi qual nota ou conteúdo modificar."
 
     if action == "obsidian_append":
-        # Remover .md do final se existir
         search_name = note_name.replace(".md", "").strip()
         path = obsidian.find_note(search_name)
         if not path:
             return False, f"Nota '{note_name}' não encontrada no vault."
         is_list = decision.get("is_list_item", False)
-        if is_list:
-            ok = obsidian.append_list_item(path, content)
-        else:
-            ok = obsidian.append_to_note(path, content)
+        ok = obsidian.append_list_item(path, content) if is_list else obsidian.append_to_note(path, content)
         if ok:
             return True, f"✅ Adicionado à nota *{path.stem}*:\n`{content}`"
         return False, "Falha ao escrever na nota."
 
     elif action == "obsidian_create":
-        # Garantir que tenha .md se não tiver
         create_path = note_name if note_name.endswith(".md") else f"{note_name}.md"
         path = obsidian.create_note(create_path, content)
         if path:
@@ -195,10 +285,260 @@ def execute_obsidian_action(decision: dict) -> tuple[bool, str]:
     return False, "Ação desconhecida."
 
 
+# ── Claude delegation ─────────────────────────────────────────────────────────
+
+def delegate_to_claude(task: str, chat_id: str, context: str = ""):
+    """Run a task in Claude Code via host_agent and send result to Telegram."""
+    import httpx
+    host_agent_url = os.getenv("HOST_AGENT_URL", "http://host.docker.internal:9000/exec")
+    host_agent_secret = os.getenv("HOST_AGENT_SECRET", "hermes-secret-mude-isso")
+
+    full_prompt = task
+    if context:
+        full_prompt = f"{task}\n\nContexto adicional:\n{context}"
+
+    _send_telegram(chat_id, f"🤖 Delegando para o Claude Code:\n`{task[:200]}`")
+    activity.record("delegate_claude", task, status="started")
+
+    def _run():
+        try:
+            log.info(f"Delegating to Claude: {task[:100]}")
+            safe_prompt = full_prompt.replace('"', "'")
+            resp = httpx.post(
+                host_agent_url,
+                json={"command": f'claude --print "{safe_prompt}"'},
+                headers={"X-Agent-Secret": host_agent_secret},
+                timeout=300,
+                verify=False,
+            )
+            output = resp.json().get("output", "(sem saída)")[:3500]
+            activity.record("delegate_claude", task, result=output, status="ok")
+            _send_telegram(chat_id, f"✅ *Claude Code concluiu:*\n```\n{output}\n```")
+        except Exception as e:
+            log.error(f"Claude delegation failed: {e}")
+            activity.record("delegate_claude", task, result=str(e), status="error")
+            _send_telegram(chat_id, f"❌ Erro ao executar no Claude Code: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+# ── Retry helper ─────────────────────────────────────────────────────────────
+
+def _with_retry(fn, *args, attempts: int = RETRY_ATTEMPTS, backoff: float = RETRY_BACKOFF, **kwargs):
+    """Call fn(*args, **kwargs) with exponential-backoff retry on exception."""
+    import time
+    last_exc = None
+    for attempt in range(attempts):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_exc = e
+            if attempt < attempts - 1:
+                wait = backoff ** attempt
+                log.warning(f"Retry {attempt + 1}/{attempts} for {fn.__name__} in {wait:.0f}s: {e}")
+                time.sleep(wait)
+    raise last_exc
+
+
+# ── Project improvement pipeline ─────────────────────────────────────────────
+
+def _build_improve_prompt(note_name: str, content: str, iteration: int, previous: list[str]) -> str:
+    prev_text = "\n---\n".join(previous) if previous else "Nenhum resultado anterior."
+    return IMPROVE_PROJECT_PROMPT.format(
+        note_name=note_name,
+        content=content[:3000],
+        iteration=iteration,
+        max_iterations=MAX_IMPROVE_ITERATIONS,
+        previous_results=prev_text[:1000],
+        date=datetime.now().strftime("%Y-%m-%d"),
+    )
+
+
+def improve_project(note_name: str, chat_id: str):
+    """
+    Multi-iteration improvement pipeline: read note → delegate to Claude →
+    append result to note → repeat up to MAX_IMPROVE_ITERATIONS.
+    Runs in a background thread.
+    """
+    import httpx
+    import time
+
+    def _run():
+        host_agent_url = os.getenv("HOST_AGENT_URL", "http://host.docker.internal:9000/exec")
+        host_agent_secret = os.getenv("HOST_AGENT_SECRET", "hermes-secret-mude-isso")
+
+        path = obsidian.find_note(note_name)
+        if not path:
+            _send_telegram(chat_id, f"❌ Nota `{note_name}` não encontrada no vault.")
+            return
+
+        _send_telegram(chat_id, f"🔧 Iniciando melhoria de `{path.stem}` ({MAX_IMPROVE_ITERATIONS} iteração/ões)…")
+        activity.record("improve_project", note_name, status="started")
+
+        previous_results: list[str] = []
+        for iteration in range(1, MAX_IMPROVE_ITERATIONS + 1):
+            try:
+                content = obsidian.read_note(path)
+                prompt = _build_improve_prompt(path.stem, content, iteration, previous_results)
+                safe_prompt = prompt.replace('"', "'")
+
+                log.info(f"Improve iteration {iteration}/{MAX_IMPROVE_ITERATIONS} for {path.stem}")
+                resp = _with_retry(
+                    httpx.post,
+                    host_agent_url,
+                    json={"command": f'claude --print "{safe_prompt}"'},
+                    headers={"X-Agent-Secret": host_agent_secret},
+                    timeout=300,
+                    verify=False,
+                )
+                output = resp.json().get("output", "(sem saída)")
+                previous_results.append(output)
+
+                # Append iteration result to note
+                section = (
+                    f"\n\n---\n## Hermes/Claude — Iteração {iteration} "
+                    f"({datetime.now().strftime('%Y-%m-%d %H:%M')})\n\n{output[:2000]}"
+                )
+                obsidian.append_to_note(path, section)
+
+                _send_telegram(
+                    chat_id,
+                    f"✅ *Iteração {iteration}/{MAX_IMPROVE_ITERATIONS}* concluída para `{path.stem}`\n"
+                    f"```\n{output[:800]}\n```"
+                )
+
+                if iteration < MAX_IMPROVE_ITERATIONS:
+                    time.sleep(3)  # brief pause before next iteration
+
+            except Exception as e:
+                log.error(f"Improve iteration {iteration} failed: {e}")
+                _send_telegram(chat_id, f"❌ Iteração {iteration} falhou: {e}")
+                activity.record("improve_project", note_name, result=str(e), status="error")
+                return
+
+        activity.record("improve_project", note_name,
+                        result=f"{MAX_IMPROVE_ITERATIONS} iterations done", status="ok")
+        _send_telegram(chat_id, f"🎉 Melhoria de `{path.stem}` concluída em {MAX_IMPROVE_ITERATIONS} iteração/ões.")
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+# ── Weekly data backup ────────────────────────────────────────────────────────
+
+def backup_data():
+    """Create a weekly snapshot of all data files. Keeps last 4 backups."""
+    import json as _json
+    data_dir = Path(os.getenv("MEMORY_FILE", "/app/data/memory.json")).parent
+    backup_dir = data_dir / "backups"
+    backup_dir.mkdir(exist_ok=True)
+
+    try:
+        snapshot = {
+            "ts": datetime.now().isoformat(),
+            "memory": json.loads((data_dir / "memory.json").read_text()) if (data_dir / "memory.json").exists() else {},
+            "tasks": json.loads((data_dir / "tasks.json").read_text()) if (data_dir / "tasks.json").exists() else {},
+            "activity_recent": activity.get_recent(50),
+        }
+        fname = backup_dir / f"backup_{datetime.now().strftime('%Y%m%d')}.json"
+        fname.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+        log.info(f"Data backup saved: {fname.name}")
+
+        # Keep only the 4 most recent backups
+        backups = sorted(backup_dir.glob("backup_*.json"))
+        for old in backups[:-4]:
+            old.unlink()
+            log.info(f"Removed old backup: {old.name}")
+
+        activity.record("backup", f"backup_{datetime.now().strftime('%Y%m%d')}.json", status="ok")
+    except Exception as e:
+        log.error(f"Backup failed: {e}")
+
+
+# ── Morning briefing ─────────────────────────────────────────────────────────
+
+def morning_briefing():
+    """Generate and send a morning briefing via Telegram. Called by APScheduler."""
+    log.info("Generating morning briefing…")
+    try:
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
+        tasks = sched.list_tasks()
+        tasks_text = "\n".join(
+            f"- {t['message']} ({t.get('run_at','') or t.get('cron','')})" for t in tasks
+        ) or "Nenhuma tarefa agendada."
+
+        # Top 5 recently modified notes as vault summary
+        notes = sorted(obsidian._all_notes(), key=lambda p: p.stat().st_mtime, reverse=True)[:5]
+        vault_summary = "\n".join(f"- {p.stem}" for p in notes) or "Vault vazio."
+
+        prompt = MORNING_BRIEFING_PROMPT.format(
+            now=now_str,
+            tasks=tasks_text,
+            vault_summary=vault_summary,
+        )
+        resp = client.chat(model=MODEL, messages=[{"role": "user", "content": prompt}])
+        briefing = resp["message"]["content"]
+        _send_telegram(DEFAULT_CHAT_ID, f"☀️ *Briefing matinal*\n\n{briefing}")
+        activity.record("morning_briefing", "daily briefing", result=briefing[:200], status="ok")
+    except Exception as e:
+        log.error(f"Morning briefing failed: {e}")
+
+
+# ── Project notes scanner ────────────────────────────────────────────────────
+
+def _find_project_notes() -> list[dict]:
+    """Find notes tagged with #projeto and assess staleness."""
+    results = []
+    for path in obsidian._all_notes():
+        try:
+            content = path.read_text(encoding="utf-8", errors="ignore")
+            if "#projeto" not in content.lower():
+                continue
+            mtime = path.stat().st_mtime
+            age_days = (datetime.now().timestamp() - mtime) / 86400
+            open_items = len([
+                l for l in content.splitlines()
+                if l.strip().startswith("- [ ]")
+            ])
+            results.append({
+                "file": str(path.relative_to(obsidian.VAULT)),
+                "path": str(path),
+                "age_days": round(age_days, 1),
+                "open_items": open_items,
+                "excerpt": content[:300].strip(),
+            })
+        except Exception:
+            continue
+    return results
+
+
+def _scan_project_notes():
+    """Background thread: alert on stale projects and suggest Claude delegation."""
+    import time
+    while True:
+        time.sleep(PROJECT_SCAN_INTERVAL)
+        try:
+            projects = _find_project_notes()
+            stale = [p for p in projects if p["age_days"] >= PROJECT_STALE_DAYS and p["open_items"] > 0]
+            if not stale:
+                continue
+
+            lines = [f"📋 *{len(stale)} projeto(s) com itens abertos há +{PROJECT_STALE_DAYS} dias:*\n"]
+            for p in stale[:5]:
+                lines.append(
+                    f"• `{p['file']}` — {p['open_items']} item(s) aberto(s), "
+                    f"última modificação há {p['age_days']} dias\n"
+                    f"  _Quer delegar ao Claude Code? Envie:_ "
+                    f"`delegar projeto {p['file']}`"
+                )
+            _send_telegram(DEFAULT_CHAT_ID, "\n".join(lines))
+            activity.record("project_scan", f"{len(stale)} stale projects", status="alert")
+        except Exception as e:
+            log.warning(f"Project scan error: {e}")
+
+
 # ── #hermes tag scanner ───────────────────────────────────────────────────────
 
 def _process_hermes_tags():
-    """Background thread: scan vault for #hermes tags and process them."""
     import time
     while True:
         time.sleep(HERMES_TAG_SCAN_INTERVAL)
@@ -232,28 +572,30 @@ def _process_hermes_tags():
                         except Exception as e:
                             reply = f"Erro ao agendar: {e}"
 
-                    # Mark as done in the note
                     obsidian.mark_hermes_done(tag["path"], tag["line_number"])
-
-                    # Notify user via Telegram
-                    _send_telegram(
-                        DEFAULT_CHAT_ID,
-                        f"📝 *#hermes* em `{tag['file']}`:\n{reply}",
-                    )
+                    _send_telegram(DEFAULT_CHAT_ID, f"📝 *#hermes* em `{tag['file']}`:\n{reply}")
                 except Exception as e:
-                    logging.warning(f"hermes tag processing failed for {tag['file']}: {e}")
+                    log.warning(f"hermes tag processing failed for {tag['file']}: {e}")
         except Exception as e:
-            logging.warning(f"hermes tag scan error: {e}")
+            log.warning(f"hermes tag scan error: {e}")
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _load_histories()
     sched.set_notify_callback(_send_telegram)
     sched.start()
+    sched.add_internal_cron(morning_briefing, MORNING_BRIEFING_CRON, "morning_briefing")
+    sched.add_internal_cron(backup_data, BACKUP_CRON, "weekly_backup")
     threading.Thread(target=_process_hermes_tags, daemon=True).start()
+    threading.Thread(target=_scan_project_notes, daemon=True).start()
+    threading.Thread(
+        target=vault_index.build_index, args=(obsidian.VAULT,), daemon=True
+    ).start()
     yield
+    _save_histories()
 
 
 app = FastAPI(title="Hermes Agent", lifespan=lifespan)
@@ -290,6 +632,24 @@ class ObsidianCreateRequest(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+_START_TIME = datetime.now()
+
+
+@app.get("/status")
+def status():
+    recent = activity.get_recent(1)
+    last_action = recent[0] if recent else None
+    return {
+        "status": "ok",
+        "model": MODEL,
+        "uptime_seconds": int((datetime.now() - _START_TIME).total_seconds()),
+        "vault_index": vault_index.get_stats(),
+        "scheduled_tasks": len(sched.list_tasks()),
+        "memory_facts": len(get_facts()),
+        "last_activity": last_action,
+    }
 
 
 @app.get("/memory")
@@ -340,6 +700,78 @@ def obsidian_hermes_tags():
     return {"pending": obsidian.scan_hermes_tags()}
 
 
+@app.get("/reflect")
+def reflect():
+    """Trigger vault reflection and return insights."""
+    try:
+        vault_idx = obsidian.get_note_index()
+        projects = _find_project_notes()
+        projects_text = "\n".join(
+            f"- {p['file']} ({p['open_items']} abertos, {p['age_days']}d atrás)" for p in projects
+        ) or "Nenhum projeto encontrado."
+        tasks_text = "\n".join(
+            f"- {t['message']}" for t in sched.list_tasks()
+        ) or "Nenhuma tarefa."
+
+        prompt = REFLECT_PROMPT.format(
+            vault_index=vault_idx[:2000],
+            projects=projects_text,
+            tasks=tasks_text,
+        )
+        resp = client.chat(model=MODEL, messages=[{"role": "user", "content": prompt}])
+        insight = resp["message"]["content"]
+        activity.record("reflect", "vault reflection", result=insight[:200], status="ok")
+        return {"insight": insight, "projects": projects}
+    except Exception as e:
+        log.error(f"Reflect failed: {e}")
+        return {"error": str(e)}
+
+
+@app.get("/activity")
+def activity_log(n: int = 10):
+    return {"entries": activity.get_recent(n)}
+
+
+@app.get("/projects")
+def projects_list():
+    return {"projects": _find_project_notes()}
+
+
+class ImproveRequest(BaseModel):
+    note: str
+    chat_id: str
+
+
+@app.post("/projects/improve")
+def projects_improve(req: ImproveRequest):
+    path = obsidian.find_note(req.note)
+    if not path:
+        return {"ok": False, "error": f"Nota '{req.note}' não encontrada."}
+    improve_project(req.note, req.chat_id)
+    return {"ok": True, "note": str(path.relative_to(obsidian.VAULT)), "iterations": MAX_IMPROVE_ITERATIONS}
+
+
+@app.get("/projects/detail")
+def project_detail(note: str):
+    path = obsidian.find_note(note)
+    if not path:
+        return {"error": f"Nota '{note}' não encontrada."}
+    content = obsidian.read_note(path)
+    lines = content.splitlines()
+    open_items = [l.strip() for l in lines if l.strip().startswith("- [ ]")]
+    done_items = [l.strip() for l in lines if l.strip().startswith("- [x]")]
+    recent = activity.get_recent(20)
+    note_activity = [e for e in recent if note.lower() in e.get("prompt", "").lower()]
+    return {
+        "file": str(path.relative_to(obsidian.VAULT)),
+        "content": content[:3000],
+        "open_items": open_items,
+        "done_items": done_items,
+        "age_days": round((datetime.now().timestamp() - path.stat().st_mtime) / 86400, 1),
+        "recent_activity": note_activity[-3:],
+    }
+
+
 @app.get("/tasks")
 def tasks_list():
     return {"tasks": sched.list_tasks()}
@@ -365,30 +797,66 @@ def tasks_cancel(task_id: str):
 
 @app.post("/chat")
 def chat(req: ChatRequest):
+    log.info(f"Chat from user={req.user_id}: {req.message[:80]}")
     history = get_history(req.user_id)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
-    note_index_short = "\n".join(
-        str(p.relative_to(obsidian.VAULT)) for p in obsidian._all_notes()
-    )[:1500]
 
-    # Classify intent
-    decision_resp = client.chat(
-        model=MODEL,
-        messages=[{"role": "user", "content": DECISION_PROMPT.format(
-            question=req.message,
-            now=now_str,
-            note_index=note_index_short,
-        )}],
-    )
-    decision_raw = decision_resp["message"]["content"]
-    decision = extract_json(decision_raw)
-    action = decision.get("action", "answer")
+    # Classify intent with gemma2:2b (with retry)
+    try:
+        decision_resp = _with_retry(
+            client.chat,
+            model=MODEL,
+            messages=[{"role": "user", "content": DECISION_PROMPT.format(
+                question=req.message,
+                now=now_str,
+            )}],
+        )
+        decision_raw = decision_resp["message"]["content"]
+        decision = extract_json(decision_raw)
+        action = decision.get("action", "answer")
+        log.debug(f"Intent: {action} | raw: {decision_raw[:120]}")
+    except Exception as e:
+        log.error(f"Intent classification failed: {e}")
+        action = "answer"
+        decision = {}
 
-    # ── Obsidian write actions ─────────────────────────────────────────────
+    # ── Obsidian read ──────────────────────────────────────────────────────
+    if action == "obsidian_read":
+        note_name = decision.get("note", "")
+        path = obsidian.find_note(note_name) if note_name else None
+        if path:
+            content = obsidian.read_note(path)
+            reply = f"📄 *{path.stem}*\n\n```\n{content[:3000]}\n```"
+        else:
+            reply = f"Não encontrei a nota '{note_name}' no vault."
+        history.append({"role": "user", "content": req.message})
+        history.append({"role": "assistant", "content": reply})
+        _save_histories()
+        return {"reply": reply, "action": "obsidian_read"}
+
+    # ── Obsidian update ────────────────────────────────────────────────────
+    if action == "obsidian_update":
+        note_name = decision.get("note", "")
+        new_content = decision.get("content", "")
+        path = obsidian.find_note(note_name) if note_name else None
+        if not path:
+            reply = f"Não encontrei a nota '{note_name}' para atualizar."
+        elif not new_content:
+            reply = "Não entendi o conteúdo novo para a nota."
+        else:
+            ok = obsidian.update_note_content(path, new_content)
+            reply = f"✅ Nota *{path.stem}* atualizada." if ok else "Falha ao atualizar a nota."
+        history.append({"role": "user", "content": req.message})
+        history.append({"role": "assistant", "content": reply})
+        _save_histories()
+        return {"reply": reply, "action": "obsidian_update"}
+
+    # ── Obsidian write ─────────────────────────────────────────────────────
     if action in ("obsidian_append", "obsidian_create"):
         ok, reply = execute_obsidian_action(decision)
         history.append({"role": "user", "content": req.message})
         history.append({"role": "assistant", "content": reply})
+        _save_histories()
         return {"reply": reply, "action": action, "ok": ok}
 
     # ── Schedule once ──────────────────────────────────────────────────────
@@ -398,32 +866,65 @@ def chat(req: ChatRequest):
             task_id = sched.add_once(decision["message"], req.chat_id, run_at)
             reply = f"✅ Agendado para {run_at.strftime('%d/%m/%Y às %H:%M')}:\n_{decision['message']}_\n\nID: `{task_id}`"
         except Exception as e:
+            log.warning(f"schedule_once failed: {e}")
             reply = f"Não consegui agendar: {e}"
         history.append({"role": "user", "content": req.message})
         history.append({"role": "assistant", "content": reply})
+        _save_histories()
         return {"reply": reply, "action": "schedule_once"}
 
     # ── Schedule recurring ─────────────────────────────────────────────────
     if action == "schedule_recurring" and decision.get("cron"):
+        cron_expr = decision["cron"]
+        if not _validate_cron(cron_expr):
+            log.warning(f"Invalid cron '{cron_expr}', falling back to schedule_once")
+            # Fall through to answer so user knows what happened
+            reply = f"Não consegui criar o lembrete recorrente (cron inválido: `{cron_expr}`). Tente especificar melhor o horário."
+            history.append({"role": "user", "content": req.message})
+            history.append({"role": "assistant", "content": reply})
+            _save_histories()
+            return {"reply": reply, "action": "schedule_recurring_failed"}
         try:
-            task_id = sched.add_recurring(decision["message"], req.chat_id, decision["cron"])
-            reply = f"✅ Lembrete recorrente criado (`{decision['cron']}`):\n_{decision['message']}_\n\nID: `{task_id}`"
+            task_id = sched.add_recurring(decision["message"], req.chat_id, cron_expr)
+            reply = f"✅ Lembrete recorrente criado (`{cron_expr}`):\n_{decision['message']}_\n\nID: `{task_id}`"
         except Exception as e:
+            log.warning(f"schedule_recurring failed: {e}")
             reply = f"Não consegui agendar: {e}"
         history.append({"role": "user", "content": req.message})
         history.append({"role": "assistant", "content": reply})
+        _save_histories()
         return {"reply": reply, "action": "schedule_recurring"}
+
+    # ── Delegate to Claude Code ────────────────────────────────────────────
+    if action == "delegate_claude" and decision.get("task"):
+        # Attach top relevant vault notes as context
+        vault_hits = vault_index.search_similar(obsidian.VAULT, decision["task"], top_k=2)
+        if not vault_hits:
+            vault_hits = obsidian.search_notes(decision["task"], max_results=2)
+        vault_ctx = "\n\n".join(f"[{h['file']}]\n{h['excerpt']}" for h in vault_hits)
+        delegate_to_claude(decision["task"], req.chat_id, context=vault_ctx)
+        reply = "🤖 Tarefa enviada ao Claude Code! Te aviso quando terminar."
+        history.append({"role": "user", "content": req.message})
+        history.append({"role": "assistant", "content": reply})
+        _save_histories()
+        return {"reply": reply, "action": "delegate_claude"}
 
     # ── Web search ─────────────────────────────────────────────────────────
     search_context = ""
     searched = False
     if action == "search" and decision.get("query"):
-        results = web_search(decision["query"])
-        search_context = f"\n\nResultados de busca:\n{results}"
-        searched = True
+        try:
+            results = web_search(decision["query"])
+            search_context = f"\n\nResultados de busca:\n{results}"
+            searched = True
+        except Exception as e:
+            log.warning(f"Web search failed: {e}")
 
     # ── Normal answer ──────────────────────────────────────────────────────
-    obsidian_hits = obsidian.search_notes(req.message)
+    # Prefer semantic search; fall back to keyword search if model unavailable
+    obsidian_hits = vault_index.search_similar(obsidian.VAULT, req.message, top_k=3)
+    if not obsidian_hits:
+        obsidian_hits = obsidian.search_notes(req.message, max_results=3)
     obsidian_context = "\n\n".join(
         f"[{h['file']}]\n{h['excerpt']}" for h in obsidian_hits
     ) if obsidian_hits else ""
@@ -433,8 +934,12 @@ def chat(req: ChatRequest):
     messages.extend(list(history))
     messages.append({"role": "user", "content": req.message + search_context})
 
-    response = client.chat(model=MODEL, messages=messages)
-    reply = response["message"]["content"]
+    try:
+        response = _with_retry(client.chat, model=MODEL, messages=messages)
+        reply = response["message"]["content"]
+    except Exception as e:
+        log.error(f"LLM chat failed: {e}")
+        reply = "Desculpe, tive um problema ao processar sua mensagem. Tente novamente."
 
     history.append({"role": "user", "content": req.message})
     history.append({"role": "assistant", "content": reply})
@@ -442,6 +947,8 @@ def chat(req: ChatRequest):
     if len(history) % 8 == 0:
         extract_and_save_facts(req.user_id)
 
+    _save_histories()
+    log.info(f"Reply to user={req.user_id}: {reply[:80]}")
     return {"reply": reply, "searched": searched}
 
 

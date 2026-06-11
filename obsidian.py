@@ -1,6 +1,7 @@
 """
 Obsidian vault read/write operations and #hermes tag processing.
 Git pull is performed before any vault access; push after any write.
+After writes the semantic index is updated asynchronously.
 """
 import os
 import re
@@ -176,6 +177,7 @@ def append_to_note(path: Path, content: str) -> bool:
             f.write(existing + separator + content)
         log.info(f"Appended to {path.name}: {content[:60]}")
         git_push(f"hermes: append to {path.stem}")
+        _index_update(path)
         return True
     except Exception as e:
         log.error(f"append_to_note failed: {e}")
@@ -198,6 +200,7 @@ def create_note(relative_path: str, content: str) -> Path | None:
             f.write(content)
         log.info(f"Created note: {path.name}")
         git_push(f"hermes: create {path.stem}")
+        _index_update(path)
         return path
     except Exception as e:
         log.error(f"create_note failed: {e}")
@@ -210,10 +213,20 @@ def update_note_content(path: Path, new_content: str) -> bool:
         with open(path, "w", encoding="utf-8", newline="") as f:
             f.write(new_content)
         git_push(f"hermes: update {path.stem}")
+        _index_update(path)
         return True
     except Exception as e:
         log.error(f"update_note_content failed: {e}")
         return False
+
+
+def _index_update(path: Path):
+    """Async index update — import deferred to avoid circular deps at module load."""
+    try:
+        import vault_index
+        vault_index.update_note(VAULT, path)
+    except Exception:
+        pass
 
 
 # ── #hermes tag scanner ───────────────────────────────────────────────────────
