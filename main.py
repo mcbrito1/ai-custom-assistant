@@ -28,8 +28,12 @@ HERMES_TAG_SCAN_INTERVAL = int(os.getenv("HERMES_TAG_SCAN_INTERVAL", "60"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 HISTORY_FILE = os.getenv("HISTORY_FILE", "/app/data/history.json")
 MORNING_BRIEFING_CRON = os.getenv("MORNING_BRIEFING_CRON", "0 8 * * *")
+BACKUP_CRON = os.getenv("BACKUP_CRON", "0 3 * * 0")  # Sundays at 3am
 PROJECT_SCAN_INTERVAL = int(os.getenv("PROJECT_SCAN_INTERVAL", "3600"))  # seconds
 PROJECT_STALE_DAYS = int(os.getenv("PROJECT_STALE_DAYS", "7"))
+MAX_IMPROVE_ITERATIONS = int(os.getenv("MAX_IMPROVE_ITERATIONS", "2"))
+RETRY_ATTEMPTS = int(os.getenv("RETRY_ATTEMPTS", "3"))
+RETRY_BACKOFF = float(os.getenv("RETRY_BACKOFF", "2.0"))
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -168,6 +172,24 @@ Gere um relatório de reflexão em português com:
 
 Seja analítico e objetivo. Máximo 400 palavras."""
 
+IMPROVE_PROJECT_PROMPT = """Você é um assistente de desenvolvimento. Analise esta nota de projeto e execute melhorias.
+
+Nome do projeto: {note_name}
+Conteúdo atual:
+{content}
+
+Iteração {iteration} de {max_iterations}.
+Resultados anteriores: {previous_results}
+
+Sua tarefa:
+1. Identifique os requisitos e itens em aberto (- [ ])
+2. Para cada item em aberto, implemente ou elabore a solução
+3. Se envolver código, escreva o código completo e funcional
+4. Marque os itens implementados como concluídos (- [x])
+5. Adicione uma seção "## Implementação {date}" com o que foi feito
+
+Responda com o resultado completo da implementação."""
+
 HERMES_TAG_PROMPT = """Texto marcado com #hermes no Obsidian do usuário. Execute a ação indicada.
 
 Arquivo: {file}
@@ -298,6 +320,138 @@ def delegate_to_claude(task: str, chat_id: str, context: str = ""):
             _send_telegram(chat_id, f"❌ Erro ao executar no Claude Code: {e}")
 
     threading.Thread(target=_run, daemon=True).start()
+
+
+# ── Retry helper ─────────────────────────────────────────────────────────────
+
+def _with_retry(fn, *args, attempts: int = RETRY_ATTEMPTS, backoff: float = RETRY_BACKOFF, **kwargs):
+    """Call fn(*args, **kwargs) with exponential-backoff retry on exception."""
+    import time
+    last_exc = None
+    for attempt in range(attempts):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_exc = e
+            if attempt < attempts - 1:
+                wait = backoff ** attempt
+                log.warning(f"Retry {attempt + 1}/{attempts} for {fn.__name__} in {wait:.0f}s: {e}")
+                time.sleep(wait)
+    raise last_exc
+
+
+# ── Project improvement pipeline ─────────────────────────────────────────────
+
+def _build_improve_prompt(note_name: str, content: str, iteration: int, previous: list[str]) -> str:
+    prev_text = "\n---\n".join(previous) if previous else "Nenhum resultado anterior."
+    return IMPROVE_PROJECT_PROMPT.format(
+        note_name=note_name,
+        content=content[:3000],
+        iteration=iteration,
+        max_iterations=MAX_IMPROVE_ITERATIONS,
+        previous_results=prev_text[:1000],
+        date=datetime.now().strftime("%Y-%m-%d"),
+    )
+
+
+def improve_project(note_name: str, chat_id: str):
+    """
+    Multi-iteration improvement pipeline: read note → delegate to Claude →
+    append result to note → repeat up to MAX_IMPROVE_ITERATIONS.
+    Runs in a background thread.
+    """
+    import httpx
+    import time
+
+    def _run():
+        host_agent_url = os.getenv("HOST_AGENT_URL", "http://host.docker.internal:9000/exec")
+        host_agent_secret = os.getenv("HOST_AGENT_SECRET", "hermes-secret-mude-isso")
+
+        path = obsidian.find_note(note_name)
+        if not path:
+            _send_telegram(chat_id, f"❌ Nota `{note_name}` não encontrada no vault.")
+            return
+
+        _send_telegram(chat_id, f"🔧 Iniciando melhoria de `{path.stem}` ({MAX_IMPROVE_ITERATIONS} iteração/ões)…")
+        activity.record("improve_project", note_name, status="started")
+
+        previous_results: list[str] = []
+        for iteration in range(1, MAX_IMPROVE_ITERATIONS + 1):
+            try:
+                content = obsidian.read_note(path)
+                prompt = _build_improve_prompt(path.stem, content, iteration, previous_results)
+                safe_prompt = prompt.replace('"', "'")
+
+                log.info(f"Improve iteration {iteration}/{MAX_IMPROVE_ITERATIONS} for {path.stem}")
+                resp = _with_retry(
+                    httpx.post,
+                    host_agent_url,
+                    json={"command": f'claude --print "{safe_prompt}"'},
+                    headers={"X-Agent-Secret": host_agent_secret},
+                    timeout=300,
+                    verify=False,
+                )
+                output = resp.json().get("output", "(sem saída)")
+                previous_results.append(output)
+
+                # Append iteration result to note
+                section = (
+                    f"\n\n---\n## Hermes/Claude — Iteração {iteration} "
+                    f"({datetime.now().strftime('%Y-%m-%d %H:%M')})\n\n{output[:2000]}"
+                )
+                obsidian.append_to_note(path, section)
+
+                _send_telegram(
+                    chat_id,
+                    f"✅ *Iteração {iteration}/{MAX_IMPROVE_ITERATIONS}* concluída para `{path.stem}`\n"
+                    f"```\n{output[:800]}\n```"
+                )
+
+                if iteration < MAX_IMPROVE_ITERATIONS:
+                    time.sleep(3)  # brief pause before next iteration
+
+            except Exception as e:
+                log.error(f"Improve iteration {iteration} failed: {e}")
+                _send_telegram(chat_id, f"❌ Iteração {iteration} falhou: {e}")
+                activity.record("improve_project", note_name, result=str(e), status="error")
+                return
+
+        activity.record("improve_project", note_name,
+                        result=f"{MAX_IMPROVE_ITERATIONS} iterations done", status="ok")
+        _send_telegram(chat_id, f"🎉 Melhoria de `{path.stem}` concluída em {MAX_IMPROVE_ITERATIONS} iteração/ões.")
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+# ── Weekly data backup ────────────────────────────────────────────────────────
+
+def backup_data():
+    """Create a weekly snapshot of all data files. Keeps last 4 backups."""
+    import json as _json
+    data_dir = Path(os.getenv("MEMORY_FILE", "/app/data/memory.json")).parent
+    backup_dir = data_dir / "backups"
+    backup_dir.mkdir(exist_ok=True)
+
+    try:
+        snapshot = {
+            "ts": datetime.now().isoformat(),
+            "memory": json.loads((data_dir / "memory.json").read_text()) if (data_dir / "memory.json").exists() else {},
+            "tasks": json.loads((data_dir / "tasks.json").read_text()) if (data_dir / "tasks.json").exists() else {},
+            "activity_recent": activity.get_recent(50),
+        }
+        fname = backup_dir / f"backup_{datetime.now().strftime('%Y%m%d')}.json"
+        fname.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+        log.info(f"Data backup saved: {fname.name}")
+
+        # Keep only the 4 most recent backups
+        backups = sorted(backup_dir.glob("backup_*.json"))
+        for old in backups[:-4]:
+            old.unlink()
+            log.info(f"Removed old backup: {old.name}")
+
+        activity.record("backup", f"backup_{datetime.now().strftime('%Y%m%d')}.json", status="ok")
+    except Exception as e:
+        log.error(f"Backup failed: {e}")
 
 
 # ── Morning briefing ─────────────────────────────────────────────────────────
@@ -434,6 +588,7 @@ async def lifespan(app: FastAPI):
     sched.set_notify_callback(_send_telegram)
     sched.start()
     sched.add_internal_cron(morning_briefing, MORNING_BRIEFING_CRON, "morning_briefing")
+    sched.add_internal_cron(backup_data, BACKUP_CRON, "weekly_backup")
     threading.Thread(target=_process_hermes_tags, daemon=True).start()
     threading.Thread(target=_scan_project_notes, daemon=True).start()
     threading.Thread(
@@ -479,14 +634,21 @@ def health():
     return {"status": "ok"}
 
 
+_START_TIME = datetime.now()
+
+
 @app.get("/status")
 def status():
+    recent = activity.get_recent(1)
+    last_action = recent[0] if recent else None
     return {
         "status": "ok",
         "model": MODEL,
+        "uptime_seconds": int((datetime.now() - _START_TIME).total_seconds()),
         "vault_index": vault_index.get_stats(),
         "scheduled_tasks": len(sched.list_tasks()),
         "memory_facts": len(get_facts()),
+        "last_activity": last_action,
     }
 
 
@@ -575,6 +737,41 @@ def projects_list():
     return {"projects": _find_project_notes()}
 
 
+class ImproveRequest(BaseModel):
+    note: str
+    chat_id: str
+
+
+@app.post("/projects/improve")
+def projects_improve(req: ImproveRequest):
+    path = obsidian.find_note(req.note)
+    if not path:
+        return {"ok": False, "error": f"Nota '{req.note}' não encontrada."}
+    improve_project(req.note, req.chat_id)
+    return {"ok": True, "note": str(path.relative_to(obsidian.VAULT)), "iterations": MAX_IMPROVE_ITERATIONS}
+
+
+@app.get("/projects/detail")
+def project_detail(note: str):
+    path = obsidian.find_note(note)
+    if not path:
+        return {"error": f"Nota '{note}' não encontrada."}
+    content = obsidian.read_note(path)
+    lines = content.splitlines()
+    open_items = [l.strip() for l in lines if l.strip().startswith("- [ ]")]
+    done_items = [l.strip() for l in lines if l.strip().startswith("- [x]")]
+    recent = activity.get_recent(20)
+    note_activity = [e for e in recent if note.lower() in e.get("prompt", "").lower()]
+    return {
+        "file": str(path.relative_to(obsidian.VAULT)),
+        "content": content[:3000],
+        "open_items": open_items,
+        "done_items": done_items,
+        "age_days": round((datetime.now().timestamp() - path.stat().st_mtime) / 86400, 1),
+        "recent_activity": note_activity[-3:],
+    }
+
+
 @app.get("/tasks")
 def tasks_list():
     return {"tasks": sched.list_tasks()}
@@ -604,9 +801,10 @@ def chat(req: ChatRequest):
     history = get_history(req.user_id)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
 
-    # Classify intent with gemma2:2b
+    # Classify intent with gemma2:2b (with retry)
     try:
-        decision_resp = client.chat(
+        decision_resp = _with_retry(
+            client.chat,
             model=MODEL,
             messages=[{"role": "user", "content": DECISION_PROMPT.format(
                 question=req.message,
@@ -737,7 +935,7 @@ def chat(req: ChatRequest):
     messages.append({"role": "user", "content": req.message + search_context})
 
     try:
-        response = client.chat(model=MODEL, messages=messages)
+        response = _with_retry(client.chat, model=MODEL, messages=messages)
         reply = response["message"]["content"]
     except Exception as e:
         log.error(f"LLM chat failed: {e}")

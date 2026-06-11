@@ -2,12 +2,13 @@
 
 ## Overview
 
-Hermes é um assistente pessoal inteligente rodando em Docker, conectado a:
-- **Ollama** (host.docker.internal:11434) com modelo gemma2:2b
+Hermes é um **secretário virtual autônomo** rodando em Docker, conectado a:
+- **Ollama** (host.docker.internal:11434) com modelo `gemma2:2b` (cérebro principal)
+- **Claude Code** via `host_agent.py` (delegação de tarefas técnicas complexas)
 - **Telegram** para interface conversacional
-- **Obsidian** vault em `C:\Git\Obsidian` (leitura/escrita com git sync)
-- **Windows host** via host_agent.py na porta 9000 (PowerShell execution via /run)
-- **APScheduler** para agendamento de tarefas
+- **Obsidian** vault em `C:\Git\Obsidian` (leitura/escrita/indexação semântica + git sync)
+- **Windows host** via host_agent.py na porta 9000 (PowerShell + Claude CLI)
+- **APScheduler** para agendamento de tarefas e jobs autônomos
 
 ---
 
@@ -15,19 +16,22 @@ Hermes é um assistente pessoal inteligente rodando em Docker, conectado a:
 
 ```
 C:\Git\Hermes\
-├── main.py              # FastAPI agent (chat endpoint, intent classification)
+├── main.py              # FastAPI agent (chat, intent classification, autonomous jobs)
 ├── bot.py              # Telegram bot with command handlers
-├── obsidian.py         # Vault read/write + #hermes tag scanner
-├── memory.py           # Persistent facts + system prompt builder
-├── scheduler.py        # APScheduler (cron + one-time tasks)
-├── host_agent.py       # Standalone HTTP server on host (PowerShell exec)
+├── obsidian.py         # Vault read/write + #hermes tag scanner + index trigger
+├── vault_index.py      # Semantic embeddings (nomic-embed-text) + cosine search
+├── memory.py           # Persistent facts + structured profile + system prompt builder
+├── scheduler.py        # APScheduler (cron + one-time + internal system jobs)
+├── activity.py         # Activity log for delegations and autonomous actions
+├── host_agent.py       # Standalone HTTP server on host (PowerShell + Claude CLI)
 ├── start_host_agent.bat # Auto-start wrapper
 ├── Dockerfile          # Python 3.12-slim + curl + git
 ├── docker-compose.yml  # Two services: hermes (agent) + hermes-bot (telegram)
 ├── requirements.txt    # Python dependencies
 ├── .env               # Config (NEVER commit this!)
 ├── .gitignore         # Excludes .env, data/, __pycache__
-├── data/              # Persistent: memory.json, tasks.json
+├── data/              # Persistent: memory.json, tasks.json, history.json,
+│                      #   vault_index.json, activity_log.json, backups/
 └── README.md          # User-facing docs
 
 C:\Git\Obsidian/      # User's knowledge base (git-synced)
@@ -137,9 +141,16 @@ docker compose restart hermes
 | Command | Purpose |
 |---|---|
 | `/run <PowerShell cmd>` | Execute command on Windows host |
+| `/delegate <task>` | Delegate task directly to Claude Code |
+| `/aprimorar <nota>` | Run improvement pipeline on a project note |
+| `/projeto <nome>` | Show project note details (open items, activity) |
+| `/projects` | List all project notes (#projeto) with status |
+| `/reflect` | Vault analysis — insights, stale projects, suggestions |
+| `/status` | Agent status panel (model, index, tasks, uptime) |
+| `/activity [n]` | Show last N delegations and autonomous actions |
 | `/memory` | View learned facts about user |
 | `/remember <fact>` | Manually add a fact |
-| `/notes <search>` | Search Obsidian vault |
+| `/notes <search>` | Search Obsidian vault (semantic + keyword fallback) |
 | `/obsidian [name]` | List all notes or search |
 | `/hermestags` | Show pending #hermes tags |
 | `/tasks` | List scheduled reminders |
@@ -268,4 +279,23 @@ ls -la C:\Git\Hermes\data\
 
 ---
 
-**Last Updated**: 2026-06-10
+## Escalada Gemma → Claude Code
+
+O `gemma2:2b` é o cérebro para classificação de intents, conversas e operações simples no vault.
+
+Escala automaticamente para Claude Code quando:
+- Tarefa envolve escrever/refatorar código
+- Scripts, automações, ou análise multi-arquivo
+- Intent `delegate_claude` detectado no classificador
+- Comando `/delegate` ou `/aprimorar` enviado manualmente
+
+## Autonomous Jobs (APScheduler)
+
+| Job | Cron | Função |
+|---|---|---|
+| Briefing matinal | `0 8 * * *` | Resume vault + tarefas do dia |
+| Scanner de projetos | a cada 1h | Alerta sobre #projeto com itens parados |
+| Backup semanal | `0 3 * * 0` | Snapshot de data/ em data/backups/ |
+| #hermes tags | a cada 60s | Processa ações marcadas no vault |
+
+**Last Updated**: 2026-06-11

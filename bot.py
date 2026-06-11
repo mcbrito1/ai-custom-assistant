@@ -295,9 +295,84 @@ async def handle_delegate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception:
         pass
-    # Force the delegation directly via the chat endpoint with a clear prefix
     await update.message.reply_text(
         f"🤖 Delegando ao Claude Code:\n`{task[:200]}`\n\nTe aviso quando terminar.",
+        parse_mode="Markdown",
+    )
+
+
+async def handle_projeto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show project note details. Usage: /projeto <nome>"""
+    if not is_owner(update):
+        return
+    note = " ".join(context.args).strip()
+    if not note:
+        await update.message.reply_text("Uso: /projeto <nome da nota>")
+        return
+    try:
+        resp = requests.get(f"{HERMES_BASE}/projects/detail", params={"note": note}, timeout=15)
+        data = resp.json()
+    except Exception as e:
+        await update.message.reply_text(f"Erro: {e}")
+        return
+    if "error" in data:
+        await update.message.reply_text(f"❌ {data['error']}")
+        return
+
+    open_items = data.get("open_items", [])
+    done_items = data.get("done_items", [])
+    recent_act = data.get("recent_activity", [])
+
+    lines = [
+        f"📋 *{data['file']}*",
+        f"Última modificação: há {data['age_days']} dias",
+        f"✅ {len(done_items)} concluído(s) · ⏳ {len(open_items)} em aberto",
+    ]
+    if open_items:
+        lines.append("\n*Itens em aberto:*")
+        for item in open_items[:10]:
+            lines.append(f"  {item}")
+    if recent_act:
+        lines.append("\n*Última atividade Hermes:*")
+        for a in recent_act[-2:]:
+            lines.append(f"  `{a['ts']}` {a['action']} [{a['status']}]")
+
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "\n...(truncado)"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def handle_aprimorar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Trigger project improvement pipeline. Usage: /aprimorar <nome da nota>"""
+    if not is_owner(update):
+        return
+    note = " ".join(context.args).strip()
+    if not note:
+        await update.message.reply_text(
+            "Uso: /aprimorar <nome da nota>\n"
+            "Ex: `/aprimorar Projeto Hermes`",
+            parse_mode="Markdown",
+        )
+        return
+    chat_id = str(update.effective_chat.id)
+    try:
+        resp = requests.post(
+            f"{HERMES_BASE}/projects/improve",
+            json={"note": note, "chat_id": chat_id},
+            timeout=15,
+        )
+        data = resp.json()
+    except Exception as e:
+        await update.message.reply_text(f"Erro: {e}")
+        return
+    if not data.get("ok"):
+        await update.message.reply_text(f"❌ {data.get('error', 'Falha desconhecida.')}")
+        return
+    await update.message.reply_text(
+        f"🔧 Melhoria iniciada para `{data['note']}`\n"
+        f"Iterações planejadas: *{data['iterations']}*\n\n"
+        f"Te aviso a cada iteração quando concluir.",
         parse_mode="Markdown",
     )
 
@@ -359,5 +434,7 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("projects", handle_projects))
     application.add_handler(CommandHandler("activity", handle_activity))
     application.add_handler(CommandHandler("delegate", handle_delegate))
+    application.add_handler(CommandHandler("projeto", handle_projeto))
+    application.add_handler(CommandHandler("aprimorar", handle_aprimorar))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.run_polling()
