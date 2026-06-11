@@ -218,7 +218,7 @@ async def handle_reflect(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text("🔍 Analisando seu vault… aguarde.")
     try:
-        resp = requests.get(f"{HERMES_BASE}/reflect", timeout=60)
+        resp = requests.get(f"{HERMES_BASE}/reflect", timeout=600)
         data = resp.json()
         if "error" in data:
             await update.message.reply_text(f"Erro: {data['error']}")
@@ -377,10 +377,85 @@ async def handle_aprimorar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def handle_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Health check on all Hermes circuits."""
+    if not is_owner(update):
+        return
+    await update.message.reply_text("🔎 Verificando circuitos…")
+
+    results = {}
+
+    # 1. Hermes agent API
+    try:
+        r = requests.get(f"{HERMES_BASE}/health", timeout=5)
+        results["hermes_api"] = ("✅", "online") if r.status_code == 200 else ("⚠️", f"status {r.status_code}")
+    except Exception as e:
+        results["hermes_api"] = ("❌", str(e)[:60])
+
+    # 2. Ollama / LLM
+    try:
+        r = requests.get(f"{HERMES_BASE}/status", timeout=10)
+        data = r.json()
+        model = data.get("model", "?")
+        results["ollama"] = ("✅", f"modelo `{model}` acessível")
+    except Exception as e:
+        results["ollama"] = ("❌", str(e)[:60])
+
+    # 3. Vault index
+    try:
+        r = requests.get(f"{HERMES_BASE}/status", timeout=10)
+        vi = r.json().get("vault_index", {})
+        n = vi.get("indexed_notes", 0)
+        mode = "semântico" if vi.get("available") else "keyword fallback"
+        results["vault_index"] = ("✅" if n > 0 else "⚠️", f"{n} notas indexadas ({mode})")
+    except Exception as e:
+        results["vault_index"] = ("❌", str(e)[:60])
+
+    # 4. Obsidian vault (note listing)
+    try:
+        r = requests.get(f"{HERMES_BASE}/obsidian/notes", timeout=10)
+        notes = r.json().get("notes", [])
+        results["obsidian_vault"] = ("✅", f"{len(notes)} notas no vault") if notes else ("⚠️", "vault vazio ou não montado")
+    except Exception as e:
+        results["obsidian_vault"] = ("❌", str(e)[:60])
+
+    # 5. Host agent (Windows PowerShell bridge)
+    try:
+        r = requests.post(
+            HOST_AGENT_URL,
+            json={"command": "echo hermes-check"},
+            headers={"X-Agent-Secret": HOST_AGENT_SECRET},
+            timeout=10,
+        )
+        out = r.json().get("output", "")
+        results["host_agent"] = ("✅", "PowerShell bridge online") if "hermes-check" in out else ("⚠️", f"resposta inesperada: {out[:40]}")
+    except Exception as e:
+        results["host_agent"] = ("❌", str(e)[:60])
+
+    # 6. Scheduler / tasks
+    try:
+        r = requests.get(f"{HERMES_BASE}/tasks", timeout=5)
+        n = len(r.json().get("tasks", []))
+        results["scheduler"] = ("✅", f"{n} tarefa(s) agendada(s)")
+    except Exception as e:
+        results["scheduler"] = ("❌", str(e)[:60])
+
+    lines = ["*🩺 Diagnóstico do Hermes*\n"]
+    all_ok = True
+    for name, (icon, detail) in results.items():
+        lines.append(f"{icon} *{name}*: {detail}")
+        if icon == "❌":
+            all_ok = False
+
+    lines.append(f"\n{'✅ Todos os circuitos operacionais.' if all_ok else '⚠️ Alguns circuitos com problema.'}")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     chat_id = str(update.effective_chat.id)
     user_text = update.message.text
+    await update.message.reply_text("⏳ Processando…")
     try:
         resp = requests.post(
             HERMES_URL,
@@ -436,5 +511,6 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("delegate", handle_delegate))
     application.add_handler(CommandHandler("projeto", handle_projeto))
     application.add_handler(CommandHandler("aprimorar", handle_aprimorar))
+    application.add_handler(CommandHandler("check", handle_check))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.run_polling()
