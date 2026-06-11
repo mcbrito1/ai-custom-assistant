@@ -120,6 +120,16 @@ def remove_completed(task_id: str):
         _save_tasks(tasks)
 
 
+def add_internal_cron(fn, cron_expr: str, job_id: str):
+    """Add a non-persistent internal cron job (system use only)."""
+    try:
+        trigger = CronTrigger.from_crontab(cron_expr, timezone="America/Sao_Paulo")
+        _scheduler.add_job(fn, trigger=trigger, id=job_id, replace_existing=True)
+        log.info(f"Internal cron job '{job_id}' scheduled: {cron_expr}")
+    except Exception as e:
+        log.warning(f"Failed to add internal job '{job_id}': {e}")
+
+
 def start():
     """Start scheduler and reload persisted tasks."""
     tasks = _load_tasks()

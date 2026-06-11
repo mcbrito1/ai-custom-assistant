@@ -12,10 +12,11 @@ from contextlib import asynccontextmanager
 from pydantic import BaseModel
 import ollama
 from duckduckgo_search import DDGS
-from memory import build_system_prompt, add_fact, get_facts, search_obsidian
+from memory import build_system_prompt, add_fact, get_facts, search_obsidian, update_profile
 import obsidian
 import vault_index
 import scheduler as sched
+import activity
 
 OLLAMA_HOST = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
 MODEL = os.getenv("OLLAMA_MODEL", "gemma2:2b")
@@ -26,6 +27,9 @@ DEFAULT_CHAT_ID = os.getenv("TELEGRAM_OWNER_ID", "0")
 HERMES_TAG_SCAN_INTERVAL = int(os.getenv("HERMES_TAG_SCAN_INTERVAL", "60"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 HISTORY_FILE = os.getenv("HISTORY_FILE", "/app/data/history.json")
+MORNING_BRIEFING_CRON = os.getenv("MORNING_BRIEFING_CRON", "0 8 * * *")
+PROJECT_SCAN_INTERVAL = int(os.getenv("PROJECT_SCAN_INTERVAL", "3600"))  # seconds
+PROJECT_STALE_DAYS = int(os.getenv("PROJECT_STALE_DAYS", "7"))
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -132,6 +136,38 @@ Se não houver fatos novos: {{"facts": []}}
 Conversa:
 {conversation}"""
 
+MORNING_BRIEFING_PROMPT = """Você é o Hermes. Prepare um briefing matinal conciso para o usuário.
+
+Data/hora: {now}
+Tarefas agendadas para hoje: {tasks}
+Resumo do vault Obsidian: {vault_summary}
+
+Escreva um briefing em português com:
+1. Saudação breve
+2. Tarefas do dia (se houver)
+3. Destaques do vault relevantes para hoje
+4. Uma sugestão proativa (se houver algo parado ou importante)
+
+Seja direto e útil. Máximo 300 palavras."""
+
+REFLECT_PROMPT = """Você é o Hermes. Analise o vault Obsidian do usuário e gere insights.
+
+Índice do vault:
+{vault_index}
+
+Projetos identificados (notas com #projeto):
+{projects}
+
+Tarefas agendadas: {tasks}
+
+Gere um relatório de reflexão em português com:
+1. Resumo geral do vault (quantas notas, temas principais)
+2. Projetos em andamento vs parados (sem progresso recente)
+3. Sugestões de próximas ações
+4. Itens que poderiam ser delegados ao Claude Code
+
+Seja analítico e objetivo. Máximo 400 palavras."""
+
 HERMES_TAG_PROMPT = """Texto marcado com #hermes no Obsidian do usuário. Execute a ação indicada.
 
 Arquivo: {file}
@@ -229,31 +265,121 @@ def execute_obsidian_action(decision: dict) -> tuple[bool, str]:
 
 # ── Claude delegation ─────────────────────────────────────────────────────────
 
-def delegate_to_claude(task: str, chat_id: str):
+def delegate_to_claude(task: str, chat_id: str, context: str = ""):
     """Run a task in Claude Code via host_agent and send result to Telegram."""
     import httpx
     host_agent_url = os.getenv("HOST_AGENT_URL", "http://host.docker.internal:9000/exec")
     host_agent_secret = os.getenv("HOST_AGENT_SECRET", "hermes-secret-mude-isso")
 
+    full_prompt = task
+    if context:
+        full_prompt = f"{task}\n\nContexto adicional:\n{context}"
+
     _send_telegram(chat_id, f"🤖 Delegando para o Claude Code:\n`{task[:200]}`")
+    activity.record("delegate_claude", task, status="started")
 
     def _run():
         try:
             log.info(f"Delegating to Claude: {task[:100]}")
+            safe_prompt = full_prompt.replace('"', "'")
             resp = httpx.post(
                 host_agent_url,
-                json={"command": f'claude --print "{task.replace(chr(34), chr(39))}"'},
+                json={"command": f'claude --print "{safe_prompt}"'},
                 headers={"X-Agent-Secret": host_agent_secret},
                 timeout=300,
                 verify=False,
             )
             output = resp.json().get("output", "(sem saída)")[:3500]
+            activity.record("delegate_claude", task, result=output, status="ok")
             _send_telegram(chat_id, f"✅ *Claude Code concluiu:*\n```\n{output}\n```")
         except Exception as e:
             log.error(f"Claude delegation failed: {e}")
+            activity.record("delegate_claude", task, result=str(e), status="error")
             _send_telegram(chat_id, f"❌ Erro ao executar no Claude Code: {e}")
 
     threading.Thread(target=_run, daemon=True).start()
+
+
+# ── Morning briefing ─────────────────────────────────────────────────────────
+
+def morning_briefing():
+    """Generate and send a morning briefing via Telegram. Called by APScheduler."""
+    log.info("Generating morning briefing…")
+    try:
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
+        tasks = sched.list_tasks()
+        tasks_text = "\n".join(
+            f"- {t['message']} ({t.get('run_at','') or t.get('cron','')})" for t in tasks
+        ) or "Nenhuma tarefa agendada."
+
+        # Top 5 recently modified notes as vault summary
+        notes = sorted(obsidian._all_notes(), key=lambda p: p.stat().st_mtime, reverse=True)[:5]
+        vault_summary = "\n".join(f"- {p.stem}" for p in notes) or "Vault vazio."
+
+        prompt = MORNING_BRIEFING_PROMPT.format(
+            now=now_str,
+            tasks=tasks_text,
+            vault_summary=vault_summary,
+        )
+        resp = client.chat(model=MODEL, messages=[{"role": "user", "content": prompt}])
+        briefing = resp["message"]["content"]
+        _send_telegram(DEFAULT_CHAT_ID, f"☀️ *Briefing matinal*\n\n{briefing}")
+        activity.record("morning_briefing", "daily briefing", result=briefing[:200], status="ok")
+    except Exception as e:
+        log.error(f"Morning briefing failed: {e}")
+
+
+# ── Project notes scanner ────────────────────────────────────────────────────
+
+def _find_project_notes() -> list[dict]:
+    """Find notes tagged with #projeto and assess staleness."""
+    results = []
+    for path in obsidian._all_notes():
+        try:
+            content = path.read_text(encoding="utf-8", errors="ignore")
+            if "#projeto" not in content.lower():
+                continue
+            mtime = path.stat().st_mtime
+            age_days = (datetime.now().timestamp() - mtime) / 86400
+            open_items = len([
+                l for l in content.splitlines()
+                if l.strip().startswith("- [ ]")
+            ])
+            results.append({
+                "file": str(path.relative_to(obsidian.VAULT)),
+                "path": str(path),
+                "age_days": round(age_days, 1),
+                "open_items": open_items,
+                "excerpt": content[:300].strip(),
+            })
+        except Exception:
+            continue
+    return results
+
+
+def _scan_project_notes():
+    """Background thread: alert on stale projects and suggest Claude delegation."""
+    import time
+    while True:
+        time.sleep(PROJECT_SCAN_INTERVAL)
+        try:
+            projects = _find_project_notes()
+            stale = [p for p in projects if p["age_days"] >= PROJECT_STALE_DAYS and p["open_items"] > 0]
+            if not stale:
+                continue
+
+            lines = [f"📋 *{len(stale)} projeto(s) com itens abertos há +{PROJECT_STALE_DAYS} dias:*\n"]
+            for p in stale[:5]:
+                lines.append(
+                    f"• `{p['file']}` — {p['open_items']} item(s) aberto(s), "
+                    f"última modificação há {p['age_days']} dias\n"
+                    f"  _Quer delegar ao Claude Code? Envie:_ "
+                    f"`delegar projeto {p['file']}`"
+                )
+            _send_telegram(DEFAULT_CHAT_ID, "\n".join(lines))
+            activity.record("project_scan", f"{len(stale)} stale projects", status="alert")
+        except Exception as e:
+            log.warning(f"Project scan error: {e}")
 
 
 # ── #hermes tag scanner ───────────────────────────────────────────────────────
@@ -307,7 +433,9 @@ async def lifespan(app: FastAPI):
     _load_histories()
     sched.set_notify_callback(_send_telegram)
     sched.start()
+    sched.add_internal_cron(morning_briefing, MORNING_BRIEFING_CRON, "morning_briefing")
     threading.Thread(target=_process_hermes_tags, daemon=True).start()
+    threading.Thread(target=_scan_project_notes, daemon=True).start()
     threading.Thread(
         target=vault_index.build_index, args=(obsidian.VAULT,), daemon=True
     ).start()
@@ -408,6 +536,43 @@ def obsidian_create(req: ObsidianCreateRequest):
 @app.get("/obsidian/hermes-tags")
 def obsidian_hermes_tags():
     return {"pending": obsidian.scan_hermes_tags()}
+
+
+@app.get("/reflect")
+def reflect():
+    """Trigger vault reflection and return insights."""
+    try:
+        vault_idx = obsidian.get_note_index()
+        projects = _find_project_notes()
+        projects_text = "\n".join(
+            f"- {p['file']} ({p['open_items']} abertos, {p['age_days']}d atrás)" for p in projects
+        ) or "Nenhum projeto encontrado."
+        tasks_text = "\n".join(
+            f"- {t['message']}" for t in sched.list_tasks()
+        ) or "Nenhuma tarefa."
+
+        prompt = REFLECT_PROMPT.format(
+            vault_index=vault_idx[:2000],
+            projects=projects_text,
+            tasks=tasks_text,
+        )
+        resp = client.chat(model=MODEL, messages=[{"role": "user", "content": prompt}])
+        insight = resp["message"]["content"]
+        activity.record("reflect", "vault reflection", result=insight[:200], status="ok")
+        return {"insight": insight, "projects": projects}
+    except Exception as e:
+        log.error(f"Reflect failed: {e}")
+        return {"error": str(e)}
+
+
+@app.get("/activity")
+def activity_log(n: int = 10):
+    return {"entries": activity.get_recent(n)}
+
+
+@app.get("/projects")
+def projects_list():
+    return {"projects": _find_project_notes()}
 
 
 @app.get("/tasks")
@@ -534,7 +699,12 @@ def chat(req: ChatRequest):
 
     # ── Delegate to Claude Code ────────────────────────────────────────────
     if action == "delegate_claude" and decision.get("task"):
-        delegate_to_claude(decision["task"], req.chat_id)
+        # Attach top relevant vault notes as context
+        vault_hits = vault_index.search_similar(obsidian.VAULT, decision["task"], top_k=2)
+        if not vault_hits:
+            vault_hits = obsidian.search_notes(decision["task"], max_results=2)
+        vault_ctx = "\n\n".join(f"[{h['file']}]\n{h['excerpt']}" for h in vault_hits)
+        delegate_to_claude(decision["task"], req.chat_id, context=vault_ctx)
         reply = "🤖 Tarefa enviada ao Claude Code! Te aviso quando terminar."
         history.append({"role": "user", "content": req.message})
         history.append({"role": "assistant", "content": reply})

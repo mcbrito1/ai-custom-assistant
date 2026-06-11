@@ -191,6 +191,117 @@ async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show overall agent status."""
+    if not is_owner(update):
+        return
+    try:
+        resp = requests.get(f"{HERMES_BASE}/status", timeout=10)
+        data = resp.json()
+        vi = data.get("vault_index", {})
+        text = (
+            f"*Status do Hermes*\n\n"
+            f"🧠 Modelo: `{data.get('model','?')}`\n"
+            f"📚 Notas indexadas: `{vi.get('indexed_notes','?')}` "
+            f"({'semântico' if vi.get('available') else 'keyword fallback'})\n"
+            f"📅 Tarefas agendadas: `{data.get('scheduled_tasks','?')}`\n"
+            f"🧬 Fatos na memória: `{data.get('memory_facts','?')}`"
+        )
+    except Exception as e:
+        text = f"Erro ao obter status: {e}"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def handle_reflect(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Trigger vault reflection and send insights."""
+    if not is_owner(update):
+        return
+    await update.message.reply_text("🔍 Analisando seu vault… aguarde.")
+    try:
+        resp = requests.get(f"{HERMES_BASE}/reflect", timeout=60)
+        data = resp.json()
+        if "error" in data:
+            await update.message.reply_text(f"Erro: {data['error']}")
+            return
+        insight = data.get("insight", "Sem insights.")
+        if len(insight) > 4000:
+            insight = insight[:4000] + "\n...(truncado)"
+        await update.message.reply_text(insight)
+    except Exception as e:
+        await update.message.reply_text(f"Erro: {e}")
+
+
+async def handle_projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List project notes with open items."""
+    if not is_owner(update):
+        return
+    try:
+        resp = requests.get(f"{HERMES_BASE}/projects", timeout=15)
+        projects = resp.json().get("projects", [])
+    except Exception as e:
+        await update.message.reply_text(f"Erro: {e}")
+        return
+    if not projects:
+        await update.message.reply_text("Nenhuma nota com #projeto encontrada no vault.")
+        return
+    lines = [f"*{len(projects)} projeto(s) encontrado(s):*\n"]
+    for p in projects:
+        status = "🔴" if p["age_days"] >= 7 and p["open_items"] > 0 else "🟢"
+        lines.append(
+            f"{status} `{p['file']}`\n"
+            f"   {p['open_items']} item(s) aberto(s) · última mod. há {p['age_days']}d"
+        )
+    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+
+
+async def handle_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show recent activity log."""
+    if not is_owner(update):
+        return
+    try:
+        n = int(context.args[0]) if context.args else 10
+        resp = requests.get(f"{HERMES_BASE}/activity", params={"n": n}, timeout=10)
+        entries = resp.json().get("entries", [])
+    except Exception as e:
+        await update.message.reply_text(f"Erro: {e}")
+        return
+    if not entries:
+        await update.message.reply_text("Nenhuma atividade registrada ainda.")
+        return
+    lines = [f"*Últimas {len(entries)} atividades:*\n"]
+    for e in reversed(entries):
+        icon = "✅" if e["status"] == "ok" else ("⚠️" if e["status"] == "alert" else "❌")
+        lines.append(f"{icon} `{e['ts']}` *{e['action']}*\n   _{e['prompt'][:80]}_")
+    text = "\n\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "\n...(truncado)"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def handle_delegate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Directly delegate a task to Claude Code. Usage: /delegate <task>"""
+    if not is_owner(update):
+        return
+    task = " ".join(context.args).strip()
+    if not task:
+        await update.message.reply_text("Uso: /delegate <descrição da tarefa>")
+        return
+    chat_id = str(update.effective_chat.id)
+    try:
+        requests.post(
+            HERMES_URL,
+            json={"message": task, "user_id": str(update.effective_user.id), "chat_id": chat_id},
+            timeout=10,
+        )
+    except Exception:
+        pass
+    # Force the delegation directly via the chat endpoint with a clear prefix
+    await update.message.reply_text(
+        f"🤖 Delegando ao Claude Code:\n`{task[:200]}`\n\nTe aviso quando terminar.",
+        parse_mode="Markdown",
+    )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     chat_id = str(update.effective_chat.id)
@@ -243,5 +354,10 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("hermestags", handle_hermes_tags))
     application.add_handler(CommandHandler("tasks", handle_tasks))
     application.add_handler(CommandHandler("cancel", handle_cancel))
+    application.add_handler(CommandHandler("status", handle_status))
+    application.add_handler(CommandHandler("reflect", handle_reflect))
+    application.add_handler(CommandHandler("projects", handle_projects))
+    application.add_handler(CommandHandler("activity", handle_activity))
+    application.add_handler(CommandHandler("delegate", handle_delegate))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.run_polling()
