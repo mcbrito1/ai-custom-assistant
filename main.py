@@ -14,6 +14,7 @@ import ollama
 from duckduckgo_search import DDGS
 from memory import build_system_prompt, add_fact, get_facts, search_obsidian
 import obsidian
+import vault_index
 import scheduler as sched
 
 OLLAMA_HOST = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
@@ -102,6 +103,8 @@ Data/hora: {now}
 EXEMPLOS:
 "Adicione leite à lista de compras" → {{"action":"obsidian_append","note":"lista de compras","content":"leite","is_list_item":true}}
 "Crie uma nota de ideias" → {{"action":"obsidian_create","note":"Ideias.md","content":"# Ideias\n"}}
+"O que está na minha nota de projetos?" → {{"action":"obsidian_read","note":"projetos"}}
+"Atualize minha nota de reunião para incluir as decisões de hoje" → {{"action":"obsidian_update","note":"reunião","content":"## Decisões\n- ..."}}
 "Me lembre amanhã às 9h de ligar para o médico" → {{"action":"schedule_once","message":"Ligar para o médico","run_at":"2026-06-12T09:00"}}
 "Me lembre todo dia às 7h de tomar água" → {{"action":"schedule_recurring","message":"Tomar água","cron":"0 7 * * *"}}
 "Refatora o arquivo main.py" → {{"action":"delegate_claude","task":"Refatora o arquivo main.py"}}
@@ -110,7 +113,10 @@ EXEMPLOS:
 "Olá, como vai?" → {{"action":"answer"}}
 
 REGRAS:
-- obsidian_append/create: modificações em notas
+- obsidian_append: adicionar item/texto a nota existente
+- obsidian_create: criar nota nova
+- obsidian_read: ler/mostrar conteúdo de uma nota
+- obsidian_update: sobrescrever/editar conteúdo de nota existente
 - schedule_once: lembrete com data/hora específica
 - schedule_recurring: lembrete que se repete (todo dia, toda semana)
 - delegate_claude: qualquer tarefa técnica (código, scripts, análise de projetos, refatoração)
@@ -302,6 +308,9 @@ async def lifespan(app: FastAPI):
     sched.set_notify_callback(_send_telegram)
     sched.start()
     threading.Thread(target=_process_hermes_tags, daemon=True).start()
+    threading.Thread(
+        target=vault_index.build_index, args=(obsidian.VAULT,), daemon=True
+    ).start()
     yield
     _save_histories()
 
@@ -340,6 +349,17 @@ class ObsidianCreateRequest(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/status")
+def status():
+    return {
+        "status": "ok",
+        "model": MODEL,
+        "vault_index": vault_index.get_stats(),
+        "scheduled_tasks": len(sched.list_tasks()),
+        "memory_facts": len(get_facts()),
+    }
 
 
 @app.get("/memory")
@@ -437,6 +457,37 @@ def chat(req: ChatRequest):
         action = "answer"
         decision = {}
 
+    # ── Obsidian read ──────────────────────────────────────────────────────
+    if action == "obsidian_read":
+        note_name = decision.get("note", "")
+        path = obsidian.find_note(note_name) if note_name else None
+        if path:
+            content = obsidian.read_note(path)
+            reply = f"📄 *{path.stem}*\n\n```\n{content[:3000]}\n```"
+        else:
+            reply = f"Não encontrei a nota '{note_name}' no vault."
+        history.append({"role": "user", "content": req.message})
+        history.append({"role": "assistant", "content": reply})
+        _save_histories()
+        return {"reply": reply, "action": "obsidian_read"}
+
+    # ── Obsidian update ────────────────────────────────────────────────────
+    if action == "obsidian_update":
+        note_name = decision.get("note", "")
+        new_content = decision.get("content", "")
+        path = obsidian.find_note(note_name) if note_name else None
+        if not path:
+            reply = f"Não encontrei a nota '{note_name}' para atualizar."
+        elif not new_content:
+            reply = "Não entendi o conteúdo novo para a nota."
+        else:
+            ok = obsidian.update_note_content(path, new_content)
+            reply = f"✅ Nota *{path.stem}* atualizada." if ok else "Falha ao atualizar a nota."
+        history.append({"role": "user", "content": req.message})
+        history.append({"role": "assistant", "content": reply})
+        _save_histories()
+        return {"reply": reply, "action": "obsidian_update"}
+
     # ── Obsidian write ─────────────────────────────────────────────────────
     if action in ("obsidian_append", "obsidian_create"):
         ok, reply = execute_obsidian_action(decision)
@@ -502,7 +553,10 @@ def chat(req: ChatRequest):
             log.warning(f"Web search failed: {e}")
 
     # ── Normal answer ──────────────────────────────────────────────────────
-    obsidian_hits = obsidian.search_notes(req.message)
+    # Prefer semantic search; fall back to keyword search if model unavailable
+    obsidian_hits = vault_index.search_similar(obsidian.VAULT, req.message, top_k=3)
+    if not obsidian_hits:
+        obsidian_hits = obsidian.search_notes(req.message, max_results=3)
     obsidian_context = "\n\n".join(
         f"[{h['file']}]\n{h['excerpt']}" for h in obsidian_hits
     ) if obsidian_hits else ""
