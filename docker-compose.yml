@@ -10,6 +10,9 @@ services:
       OLLAMA_BASE_URL: http://host.docker.internal:11434
       OLLAMA_HOST: http://host.docker.internal:11434
       OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma2:2b}
+      INTENT_MODEL: ${INTENT_MODEL:-qwen2.5:1.5b}
+      REASONING_MODEL: ${REASONING_MODEL:-deepseek-r1:1.5b}
+      CODE_MODEL: ${CODE_MODEL:-qwen2.5-coder:1.5b}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       PYTHONUNBUFFERED: "1"
       MEMORY_FILE: /app/data/memory.json

@@ -19,7 +19,21 @@ import scheduler as sched
 import activity
 
 OLLAMA_HOST = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
-MODEL = os.getenv("OLLAMA_MODEL", "gemma2:2b")
+
+# ── Model routing ─────────────────────────────────────────────────────────────
+# INTENT_MODEL   : fast JSON classification (qwen2.5:1.5b excels at structured output)
+# CHAT_MODEL     : conversational answers (gemma2:2b, fluid in Portuguese)
+# REASONING_MODEL: analysis, reflection, briefing, fact extraction (deepseek-r1:1.5b)
+# CODE_MODEL     : code context prep for /aprimorar pipeline (qwen2.5-coder:1.5b)
+# Falls back to CHAT_MODEL if a specialized model is unavailable.
+CHAT_MODEL      = os.getenv("OLLAMA_MODEL",      "gemma2:2b")
+INTENT_MODEL    = os.getenv("INTENT_MODEL",      "qwen2.5:1.5b")
+REASONING_MODEL = os.getenv("REASONING_MODEL",   "deepseek-r1:1.5b")
+CODE_MODEL      = os.getenv("CODE_MODEL",        "qwen2.5-coder:1.5b")
+
+# Legacy alias so existing callers that used MODEL still work
+MODEL = CHAT_MODEL
+
 HISTORY_SIZE = int(os.getenv("HISTORY_SIZE", "20"))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_OWNER_ID = os.getenv("TELEGRAM_OWNER_ID", "0")
@@ -242,11 +256,11 @@ def extract_and_save_facts(user_id: str):
         for m in history
     )
     try:
-        resp = client.chat(
-            model=MODEL,
-            messages=[{"role": "user", "content": EXTRACT_FACTS_PROMPT.format(conversation=conversation)}],
+        raw = _llm(
+            REASONING_MODEL,
+            [{"role": "user", "content": EXTRACT_FACTS_PROMPT.format(conversation=conversation)}],
         )
-        data = extract_json(resp["message"]["content"])
+        data = extract_json(raw)
         for fact in data.get("facts", []):
             if fact and len(fact) > 5:
                 add_fact(fact)
@@ -322,6 +336,40 @@ def delegate_to_claude(task: str, chat_id: str, context: str = ""):
     threading.Thread(target=_run, daemon=True).start()
 
 
+# ── Model availability cache ──────────────────────────────────────────────────
+_model_available: dict[str, bool] = {}
+
+
+def _is_model_available(model: str) -> bool:
+    if model in _model_available:
+        return _model_available[model]
+    try:
+        models = client.list()
+        names = [m.get("name", m.get("model", "")) for m in models.get("models", [])]
+        available = any(model in name for name in names)
+        _model_available[model] = available
+        if not available:
+            log.warning(f"Model '{model}' not found in Ollama — will fall back to {CHAT_MODEL}")
+        return available
+    except Exception as e:
+        log.warning(f"Could not check model availability: {e}")
+        _model_available[model] = False
+        return False
+
+
+def _llm(model: str, messages: list, fallback: str = CHAT_MODEL) -> str:
+    """
+    Call Ollama with the given model, falling back to `fallback` if unavailable.
+    Strips DeepSeek-R1 <think>…</think> blocks from the output automatically.
+    """
+    target = model if _is_model_available(model) else fallback
+    resp = _with_retry(client.chat, model=target, messages=messages)
+    text = resp["message"]["content"]
+    # DeepSeek-R1 wraps its chain-of-thought in <think> blocks — strip before returning
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    return text
+
+
 # ── Retry helper ─────────────────────────────────────────────────────────────
 
 def _with_retry(fn, *args, attempts: int = RETRY_ATTEMPTS, backoff: float = RETRY_BACKOFF, **kwargs):
@@ -379,8 +427,18 @@ def improve_project(note_name: str, chat_id: str):
         for iteration in range(1, MAX_IMPROVE_ITERATIONS + 1):
             try:
                 content = obsidian.read_note(path)
-                prompt = _build_improve_prompt(path.stem, content, iteration, previous_results)
-                safe_prompt = prompt.replace('"', "'")
+                raw_prompt = _build_improve_prompt(path.stem, content, iteration, previous_results)
+
+                # qwen2.5-coder pre-processes the task into a precise technical brief
+                # before handing off to Claude Code for actual execution
+                code_brief = _llm(
+                    CODE_MODEL,
+                    [{"role": "user", "content":
+                      f"Analise esta nota de projeto e crie um brief técnico preciso "
+                      f"para um desenvolvedor executar. Liste: arquivos a modificar, "
+                      f"mudanças específicas, e ordem de execução. Máximo 300 palavras.\n\n{raw_prompt}"}],
+                )
+                safe_prompt = (raw_prompt + f"\n\nBrief técnico:\n{code_brief}").replace('"', "'")
 
                 log.info(f"Improve iteration {iteration}/{MAX_IMPROVE_ITERATIONS} for {path.stem}")
                 resp = _with_retry(
@@ -475,8 +533,7 @@ def morning_briefing():
             tasks=tasks_text,
             vault_summary=vault_summary,
         )
-        resp = client.chat(model=MODEL, messages=[{"role": "user", "content": prompt}])
-        briefing = resp["message"]["content"]
+        briefing = _llm(REASONING_MODEL, [{"role": "user", "content": prompt}])
         _send_telegram(DEFAULT_CHAT_ID, f"☀️ *Briefing matinal*\n\n{briefing}")
         activity.record("morning_briefing", "daily briefing", result=briefing[:200], status="ok")
     except Exception as e:
@@ -556,11 +613,8 @@ def _process_hermes_tags():
                         now=now_str,
                         note_index=note_index,
                     )
-                    resp = client.chat(
-                        model=MODEL,
-                        messages=[{"role": "user", "content": prompt}],
-                    )
-                    decision = extract_json(resp["message"]["content"])
+                    raw = _llm(REASONING_MODEL, [{"role": "user", "content": prompt}])
+                    decision = extract_json(raw)
                     reply = decision.pop("reply", f"Processado: {tag['line_text'][:60]}")
 
                     if decision.get("action") in ("obsidian_append", "obsidian_create"):
@@ -643,7 +697,13 @@ def status():
     last_action = recent[0] if recent else None
     return {
         "status": "ok",
-        "model": MODEL,
+        "models": {
+            "chat":      CHAT_MODEL,
+            "intent":    INTENT_MODEL,
+            "reasoning": REASONING_MODEL,
+            "code":      CODE_MODEL,
+            "embed":     os.getenv("EMBED_MODEL", "nomic-embed-text"),
+        },
         "uptime_seconds": int((datetime.now() - _START_TIME).total_seconds()),
         "vault_index": vault_index.get_stats(),
         "scheduled_tasks": len(sched.list_tasks()),
@@ -718,8 +778,7 @@ def reflect():
             projects=projects_text,
             tasks=tasks_text,
         )
-        resp = client.chat(model=MODEL, messages=[{"role": "user", "content": prompt}])
-        insight = resp["message"]["content"]
+        insight = _llm(REASONING_MODEL, [{"role": "user", "content": prompt}])
         activity.record("reflect", "vault reflection", result=insight[:200], status="ok")
         return {"insight": insight, "projects": projects}
     except Exception as e:
@@ -801,20 +860,18 @@ def chat(req: ChatRequest):
     history = get_history(req.user_id)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
 
-    # Classify intent with gemma2:2b (with retry)
+    # Classify intent — qwen2.5:1.5b is more reliable for structured JSON output
     try:
-        decision_resp = _with_retry(
-            client.chat,
-            model=MODEL,
-            messages=[{"role": "user", "content": DECISION_PROMPT.format(
+        decision_raw = _llm(
+            INTENT_MODEL,
+            [{"role": "user", "content": DECISION_PROMPT.format(
                 question=req.message,
                 now=now_str,
             )}],
         )
-        decision_raw = decision_resp["message"]["content"]
         decision = extract_json(decision_raw)
         action = decision.get("action", "answer")
-        log.debug(f"Intent: {action} | raw: {decision_raw[:120]}")
+        log.debug(f"Intent ({INTENT_MODEL}): {action} | raw: {decision_raw[:120]}")
     except Exception as e:
         log.error(f"Intent classification failed: {e}")
         action = "answer"
@@ -935,8 +992,7 @@ def chat(req: ChatRequest):
     messages.append({"role": "user", "content": req.message + search_context})
 
     try:
-        response = _with_retry(client.chat, model=MODEL, messages=messages)
-        reply = response["message"]["content"]
+        reply = _llm(CHAT_MODEL, messages)
     except Exception as e:
         log.error(f"LLM chat failed: {e}")
         reply = "Desculpe, tive um problema ao processar sua mensagem. Tente novamente."
