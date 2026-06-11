@@ -16,6 +16,7 @@ services:
       TASKS_FILE: /app/data/tasks.json
       OBSIDIAN_VAULT: /obsidian
       HERMES_TAG_SCAN_INTERVAL: ${HERMES_TAG_SCAN_INTERVAL:-60}
+      HISTORY_FILE: /app/data/history.json
       TELEGRAM_TOKEN: ${TELEGRAM_TOKEN}
       TELEGRAM_OWNER_ID: ${TELEGRAM_OWNER_ID}
 
