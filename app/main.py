@@ -238,12 +238,48 @@ Notas disponíveis: {note_index}"""
 # ── LLM helpers ───────────────────────────────────────────────────────────────
 
 def extract_json(text: str) -> dict:
-    match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group())
-        except Exception:
-            pass
+    """Extract the first valid JSON object from text, handling nested structures."""
+    # Try to parse the whole text first (model returned pure JSON)
+    stripped = text.strip()
+    try:
+        result = json.loads(stripped)
+        if isinstance(result, dict):
+            return result
+    except Exception:
+        pass
+
+    # Walk through text finding '{' and try to parse from that position
+    for i, ch in enumerate(text):
+        if ch != '{':
+            continue
+        # Track brace depth to find the matching closing brace
+        depth = 0
+        in_string = False
+        escape = False
+        for j, c in enumerate(text[i:], start=i):
+            if escape:
+                escape = False
+                continue
+            if c == '\\' and in_string:
+                escape = True
+                continue
+            if c == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0:
+                    candidate = text[i:j + 1]
+                    try:
+                        result = json.loads(candidate)
+                        if isinstance(result, dict):
+                            return result
+                    except Exception:
+                        break
     return {}
 
 
