@@ -255,7 +255,8 @@ def _validate_cron(expr: str) -> bool:
 
 
 def web_search(query: str, max_results: int = 5) -> str:
-    with DDGS() as ddgs:
+    # verify=False for corporate SSL proxy environments
+    with DDGS(verify=False) as ddgs:
         results = list(ddgs.text(query, max_results=max_results))
     if not results:
         return "Nenhum resultado encontrado."
