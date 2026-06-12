@@ -17,6 +17,7 @@ VAULT_INDEX_FILE = os.getenv("VAULT_INDEX_FILE", "/app/data/vault_index.json")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
 OLLAMA_HOST = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
 SIMILARITY_THRESHOLD = float(os.getenv("EMBED_SIMILARITY_THRESHOLD", "0.3"))
+AUTO_SUMMARIZE_THRESHOLD = int(os.getenv("AUTO_SUMMARIZE_THRESHOLD", "1000"))  # chars
 
 _client: ollama.Client | None = None
 _index: dict[str, dict] = {}
@@ -105,14 +106,19 @@ def build_index(vault: Path):
             if _index.get(rel, {}).get("mtime") == mtime:
                 continue
             content = note_path.read_text(encoding="utf-8", errors="ignore")
-            embedding = _embed(f"{note_path.stem}\n{content}")
+            summary = _auto_summarize(note_path.stem, content)
+            embed_text = f"{note_path.stem}\n{summary or content[:2000]}"
+            embedding = _embed(embed_text)
             if embedding is None:
                 continue
             with _lock:
                 _index[rel] = {
                     "embedding": embedding,
                     "mtime": mtime,
-                    "excerpt": content[:400].strip(),
+                    "excerpt": (summary or content[:400]).strip(),
+                    "has_summary": bool(summary),
+                    "use_count": _index.get(rel, {}).get("use_count", 0),
+                    "last_used": _index.get(rel, {}).get("last_used"),
                 }
             updated += 1
         except Exception as e:
@@ -236,6 +242,33 @@ def _adaptive_threshold() -> float:
     if avg > 5:
         return min(SIMILARITY_THRESHOLD + 0.05, 0.6)
     return SIMILARITY_THRESHOLD
+
+
+def _auto_summarize(stem: str, content: str) -> str | None:
+    """
+    Summarize notes longer than AUTO_SUMMARIZE_THRESHOLD chars using the reasoning model.
+    Returns None if content is short enough or model is unavailable.
+    """
+    if len(content) <= AUTO_SUMMARIZE_THRESHOLD:
+        return None
+    try:
+        import ollama as _ollama
+        REASONING_MODEL = os.getenv("REASONING_MODEL", "deepseek-r1:1.5b")
+        client = _ollama.Client(host=OLLAMA_HOST)
+        prompt = (
+            f"Resuma esta nota do Obsidian em no máximo 200 palavras, "
+            f"preservando os pontos principais, itens de ação e conceitos-chave.\n\n"
+            f"Nota: {stem}\n\n{content[:4000]}"
+        )
+        resp = client.chat(model=REASONING_MODEL,
+                           messages=[{"role": "user", "content": prompt}])
+        raw = resp["message"]["content"]
+        # Strip DeepSeek-R1 think blocks
+        import re
+        return re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+    except Exception as e:
+        log.debug(f"Auto-summarize failed for {stem}: {e}")
+        return None
 
 
 def get_stats() -> dict:

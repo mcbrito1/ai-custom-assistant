@@ -433,6 +433,38 @@ async def handle_aprimorar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def handle_agenda(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List upcoming calendar events. Usage: /agenda [days]"""
+    if not is_owner(update):
+        return
+    days = int(context.args[0]) if context.args else 7
+    try:
+        resp = requests.get(f"{HERMES_BASE}/calendar/events", params={"days": days}, timeout=15)
+        data = resp.json()
+    except Exception as e:
+        await update.message.reply_text(f"Erro: {e}")
+        return
+    if "error" in data:
+        await update.message.reply_text(
+            f"📅 {data['error']}\n\n"
+            "_Para configurar: adicione `google_credentials.json` em `data/` e defina `GOOGLE_CREDS_PATH` no `.env`._",
+            parse_mode="Markdown",
+        )
+        return
+    events = data.get("events", [])
+    if not events:
+        await update.message.reply_text(f"Nenhum evento nos próximos {days} dias.")
+        return
+    lines = [f"*📅 Agenda — próximos {days} dias:*\n"]
+    for e in events:
+        start = e["start"].replace("T", " ")[:16] if "T" in e["start"] else e["start"]
+        line = f"• `{start}` — {e['summary']}"
+        if e.get("location"):
+            line += f" 📍 {e['location']}"
+        lines.append(line)
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 async def handle_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Health check on all Hermes circuits."""
     if not is_owner(update):
@@ -496,6 +528,14 @@ async def handle_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         results["scheduler"] = ("✅", f"{n} tarefa(s) agendada(s)")
     except Exception as e:
         results["scheduler"] = ("❌", str(e)[:60])
+
+    # 7. Google Calendar
+    try:
+        r = requests.get(f"{HERMES_BASE}/status", timeout=10)
+        cal_ok = r.json().get("calendar_available", False)
+        results["google_calendar"] = ("✅", "configurado") if cal_ok else ("⚠️", "não configurado (opcional)")
+    except Exception as e:
+        results["google_calendar"] = ("❌", str(e)[:60])
 
     lines = ["*🩺 Diagnóstico do Hermes*\n"]
     all_ok = True
@@ -568,6 +608,7 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("delegate", handle_delegate))
     application.add_handler(CommandHandler("projeto", handle_projeto))
     application.add_handler(CommandHandler("aprimorar", handle_aprimorar))
+    application.add_handler(CommandHandler("agenda", handle_agenda))
     application.add_handler(CommandHandler("check", handle_check))
     application.add_handler(CallbackQueryHandler(handle_feedback_callback, pattern=r"^fb:"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

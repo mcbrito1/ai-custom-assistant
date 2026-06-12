@@ -20,18 +20,20 @@ import vault_index
 import scheduler as sched
 import activity
 import learner
+import conversation_rag
+import calendar_integration
 
 OLLAMA_HOST = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
 
 # ── Model routing ─────────────────────────────────────────────────────────────
-# INTENT_MODEL   : fast JSON classification (qwen2.5:1.5b excels at structured output)
-# CHAT_MODEL     : conversational answers (gemma2:2b, fluid in Portuguese)
-# REASONING_MODEL: analysis, reflection, briefing, fact extraction (deepseek-r1:1.5b)
-# CODE_MODEL     : code context prep for /aprimorar pipeline (qwen2.5-coder:1.5b)
+# INTENT_MODEL   : JSON classification — hermes3:3b (strong instruction follower, ChatML)
+# CHAT_MODEL     : conversational answers — gemma2:2b (fluid Portuguese)
+# REASONING_MODEL: analysis, reflection, briefing, fact extraction — hermes3:3b
+# CODE_MODEL     : code context prep for /aprimorar pipeline — qwen2.5-coder:1.5b
 # Falls back to CHAT_MODEL if a specialized model is unavailable.
 CHAT_MODEL      = os.getenv("OLLAMA_MODEL",      "gemma2:2b")
-INTENT_MODEL    = os.getenv("INTENT_MODEL",      "qwen2.5:1.5b")
-REASONING_MODEL = os.getenv("REASONING_MODEL",   "deepseek-r1:1.5b")
+INTENT_MODEL    = os.getenv("INTENT_MODEL",      "hermes3:3b")
+REASONING_MODEL = os.getenv("REASONING_MODEL",   "hermes3:3b")
 CODE_MODEL      = os.getenv("CODE_MODEL",        "qwen2.5-coder:1.5b")
 
 # Legacy alias so existing callers that used MODEL still work
@@ -46,8 +48,9 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 HISTORY_FILE = os.getenv("HISTORY_FILE", "/app/data/history.json")
 MORNING_BRIEFING_CRON = os.getenv("MORNING_BRIEFING_CRON", "0 8 * * *")
 BACKUP_CRON = os.getenv("BACKUP_CRON", "0 3 * * 0")
-WEEKLY_REFLECTION_CRON = os.getenv("WEEKLY_REFLECTION_CRON", "0 22 * * 6")  # Saturdays at 22h
-PROJECT_SCAN_INTERVAL = int(os.getenv("PROJECT_SCAN_INTERVAL", "3600"))  # seconds
+WEEKLY_REFLECTION_CRON = os.getenv("WEEKLY_REFLECTION_CRON", "0 22 * * 6")
+PROJECT_SCAN_INTERVAL = int(os.getenv("PROJECT_SCAN_INTERVAL", "3600"))
+AGENT_MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "5"))
 PROJECT_STALE_DAYS = int(os.getenv("PROJECT_STALE_DAYS", "7"))
 MAX_IMPROVE_ITERATIONS = int(os.getenv("MAX_IMPROVE_ITERATIONS", "2"))
 RETRY_ATTEMPTS = int(os.getenv("RETRY_ATTEMPTS", "3"))
@@ -120,92 +123,77 @@ def _send_telegram(chat_id: str, text: str, task_id: str = ""):
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
-# Kept short and directive for gemma2:2b. Few-shot examples drive reliable JSON output.
-DECISION_PROMPT = """Classifique a mensagem e retorne APENAS um JSON válido, sem explicações.
+# ── Prompts (hermes3:3b uses ChatML system messages; gemma2:2b gets inline prompts) ──
 
-Mensagem: "{question}"
+# Intent classifier — system message defines schema+rules; user message is the input only.
+DECISION_SYSTEM = """Você é o classificador de intenções do Hermes. Retorne APENAS JSON válido, sem texto extra.
+
+Schema de saída (escolha exatamente um):
+{"action":"obsidian_append","note":"<nome>","content":"<texto>","is_list_item":true|false}
+{"action":"obsidian_create","note":"<nome>.md","content":"<conteúdo>"}
+{"action":"obsidian_read","note":"<nome>"}
+{"action":"obsidian_update","note":"<nome>","content":"<novo conteúdo>"}
+{"action":"schedule_once","message":"<lembrete>","run_at":"<ISO8601>"}
+{"action":"schedule_recurring","message":"<lembrete>","cron":"<5 campos cron>"}
+{"action":"delegate_claude","task":"<descrição completa>"}
+{"action":"agent_plan","task":"<descrição completa>"}
+{"action":"calendar_create","summary":"<título>","start":"<ISO8601>","duration_minutes":<int>}
+{"action":"calendar_list","days":<int>}
+{"action":"search","query":"<consulta>"}
+{"action":"answer"}
+
+Regras:
+- obsidian_append: adicionar a nota existente | obsidian_create: criar nota nova
+- obsidian_read: ler/mostrar nota | obsidian_update: sobrescrever nota existente
+- schedule_once: lembrete pontual | schedule_recurring: lembrete periódico (todo dia/semana)
+- delegate_claude: código, scripts, refatoração, análise técnica
+- agent_plan: múltiplos passos heterogêneos (pesquisar E criar E agendar)
+- calendar_create/list: eventos no Google Calendar
+- search: pergunta factual sobre o mundo | answer: conversa geral"""
+
+DECISION_PROMPT = "Data/hora: {now}\nMensagem: {question}"
+
+EXTRACT_FACTS_SYSTEM = """Extraia fatos duradouros sobre o usuário (nome, profissão, projetos, hábitos, preferências).
+Retorne APENAS JSON: {"facts": ["fato 1", "fato 2"]}
+Se não houver fatos: {"facts": []}"""
+
+EXTRACT_FACTS_PROMPT = "Conversa:\n{conversation}"
+
+AGENT_PLAN_SYSTEM = """Você é o Hermes. Quebre a tarefa em passos independentes e retorne APENAS JSON.
+Schema: {"steps": [{"action": "search"|"obsidian_create"|"obsidian_append"|"schedule_once"|"calendar_create"|"delegate_claude"|"answer", ...campos específicos da ação...}]}
+Máximo {max_steps} passos. Cada passo deve ser executável isoladamente."""
+
+AGENT_PLAN_PROMPT = """Tarefa: {task}
 Data/hora: {now}
+Notas disponíveis: {note_index}
+Google Calendar disponível: {calendar_available}"""
 
-EXEMPLOS:
-"Adicione leite à lista de compras" → {{"action":"obsidian_append","note":"lista de compras","content":"leite","is_list_item":true}}
-"Crie uma nota de ideias" → {{"action":"obsidian_create","note":"Ideias.md","content":"# Ideias\n"}}
-"O que está na minha nota de projetos?" → {{"action":"obsidian_read","note":"projetos"}}
-"Atualize minha nota de reunião para incluir as decisões de hoje" → {{"action":"obsidian_update","note":"reunião","content":"## Decisões\n- ..."}}
-"Me lembre amanhã às 9h de ligar para o médico" → {{"action":"schedule_once","message":"Ligar para o médico","run_at":"2026-06-12T09:00"}}
-"Me lembre todo dia às 7h de tomar água" → {{"action":"schedule_recurring","message":"Tomar água","cron":"0 7 * * *"}}
-"Refatora o arquivo main.py" → {{"action":"delegate_claude","task":"Refatora o arquivo main.py"}}
-"Cria um script Python para renomear arquivos" → {{"action":"delegate_claude","task":"Cria um script Python para renomear arquivos"}}
-"O que é Docker?" → {{"action":"search","query":"O que é Docker"}}
-"Olá, como vai?" → {{"action":"answer"}}
+WEEKLY_REFLECTION_SYSTEM = """Você é o Hermes fazendo reflexão semanal. Responda em português, de forma direta e acionável. Máximo 300 palavras.
+Estruture em: O que funcionou | O que falhou | Padrões detectados | Próxima semana | Sugestão proativa"""
 
-REGRAS:
-- obsidian_append: adicionar item/texto a nota existente
-- obsidian_create: criar nota nova
-- obsidian_read: ler/mostrar conteúdo de uma nota
-- obsidian_update: sobrescrever/editar conteúdo de nota existente
-- schedule_once: lembrete com data/hora específica
-- schedule_recurring: lembrete que se repete (todo dia, toda semana)
-- delegate_claude: qualquer tarefa técnica (código, scripts, análise de projetos, refatoração)
-- search: perguntas factuais sobre o mundo
-- answer: conversa geral
-
-Retorne APENAS o JSON."""
-
-EXTRACT_FACTS_PROMPT = """Extraia fatos duradouros sobre o usuário desta conversa (nome, profissão, projetos, hábitos, preferências).
-Retorne APENAS JSON: {{"facts": ["fato 1", "fato 2"]}}
-Se não houver fatos novos: {{"facts": []}}
-
-Conversa:
-{conversation}"""
-
-WEEKLY_REFLECTION_PROMPT = """Você é o Hermes fazendo uma reflexão semanal sobre seu desempenho.
-
-Atividades dos últimos 7 dias:
+WEEKLY_REFLECTION_PROMPT = """Atividades dos últimos 7 dias:
 {activity_summary}
 
-Padrões de comportamento do usuário:
-{behavior_summary}
+Padrões de comportamento:
+{behavior_summary}"""
 
-Analise e responda em português:
-1. O que funcionou bem esta semana?
-2. O que falhou ou foi ineficiente?
-3. Quais padrões de uso você identificou?
-4. O que você faria diferente na próxima semana?
-5. Alguma sugestão proativa para o usuário?
+MORNING_BRIEFING_SYSTEM = """Você é o Hermes. Escreva um briefing matinal em português. Máximo 300 palavras.
+Estruture em: Saudação | Tarefas do dia | Destaques do vault | Sugestão proativa"""
 
-Seja direto e acionável. Máximo 300 palavras."""
-
-MORNING_BRIEFING_PROMPT = """Você é o Hermes. Prepare um briefing matinal conciso para o usuário.
-
-Data/hora: {now}
+MORNING_BRIEFING_PROMPT = """Data/hora: {now}
 Tarefas agendadas para hoje: {tasks}
-Resumo do vault Obsidian: {vault_summary}
+Resumo do vault: {vault_summary}"""
 
-Escreva um briefing em português com:
-1. Saudação breve
-2. Tarefas do dia (se houver)
-3. Destaques do vault relevantes para hoje
-4. Uma sugestão proativa (se houver algo parado ou importante)
+REFLECT_SYSTEM = """Você é o Hermes. Analise o vault e gere insights em português. Máximo 400 palavras.
+Estruture em: Resumo do vault | Projetos em andamento vs parados | Próximas ações sugeridas | Itens para delegar ao Claude Code"""
 
-Seja direto e útil. Máximo 300 palavras."""
-
-REFLECT_PROMPT = """Você é o Hermes. Analise o vault Obsidian do usuário e gere insights.
-
-Índice do vault:
+REFLECT_PROMPT = """Índice do vault:
 {vault_index}
 
-Projetos identificados (notas com #projeto):
+Projetos (#projeto):
 {projects}
 
-Tarefas agendadas: {tasks}
-
-Gere um relatório de reflexão em português com:
-1. Resumo geral do vault (quantas notas, temas principais)
-2. Projetos em andamento vs parados (sem progresso recente)
-3. Sugestões de próximas ações
-4. Itens que poderiam ser delegados ao Claude Code
-
-Seja analítico e objetivo. Máximo 400 palavras."""
+Tarefas agendadas: {tasks}"""
 
 IMPROVE_PROJECT_PROMPT = """Você é um assistente de desenvolvimento. Analise esta nota de projeto e execute melhorias.
 
@@ -225,18 +213,17 @@ Sua tarefa:
 
 Responda com o resultado completo da implementação."""
 
-HERMES_TAG_PROMPT = """Texto marcado com #hermes no Obsidian do usuário. Execute a ação indicada.
+HERMES_TAG_SYSTEM = """Processe a linha marcada com #hermes no Obsidian. Retorne APENAS JSON com a ação e campo "reply".
+Opções:
+{"action":"answer","reply":"<msg>"}
+{"action":"obsidian_append","note":"<nome>","content":"<texto>","is_list_item":true,"reply":"<confirmação>"}
+{"action":"obsidian_create","note":"<nome>.md","content":"<conteúdo>","reply":"<confirmação>"}
+{"action":"schedule_once","message":"<lembrete>","run_at":"<ISO8601>","reply":"<confirmação>"}"""
 
-Arquivo: {file}
+HERMES_TAG_PROMPT = """Arquivo: {file}
 Texto: {line}
 Data/hora: {now}
-Notas disponíveis: {note_index}
-
-Retorne APENAS JSON com a ação e confirmação:
-{{"action":"answer","reply":"mensagem ao usuário"}}
-{{"action":"obsidian_append","note":"nome","content":"texto","is_list_item":true,"reply":"confirmação"}}
-{{"action":"obsidian_create","note":"caminho.md","content":"conteúdo","reply":"confirmação"}}
-{{"action":"schedule_once","message":"lembrete","run_at":"ISO8601","reply":"confirmação"}}"""
+Notas disponíveis: {note_index}"""
 
 
 # ── LLM helpers ───────────────────────────────────────────────────────────────
@@ -284,6 +271,7 @@ def extract_and_save_facts(user_id: str):
             raw = _llm(
                 REASONING_MODEL,
                 [{"role": "user", "content": EXTRACT_FACTS_PROMPT.format(conversation=conversation)}],
+                system=EXTRACT_FACTS_SYSTEM,
             )
             new_facts = [f for f in extract_json(raw).get("facts", []) if f and len(f) > 5]
             if not new_facts:
@@ -401,15 +389,17 @@ def _is_model_available(model: str) -> bool:
         return False
 
 
-def _llm(model: str, messages: list, fallback: str = CHAT_MODEL) -> str:
+def _llm(model: str, messages: list, fallback: str = CHAT_MODEL, system: str = None) -> str:
     """
     Call Ollama with the given model, falling back to `fallback` if unavailable.
-    Strips DeepSeek-R1 <think>…</think> blocks from the output automatically.
+    Pass system= to prepend a system message (hermes3 supports ChatML system role natively).
+    Strips <think>…</think> blocks from output (DeepSeek-R1 compatibility).
     """
     target = model if _is_model_available(model) else fallback
+    if system:
+        messages = [{"role": "system", "content": system}] + list(messages)
     resp = _with_retry(client.chat, model=target, messages=messages)
     text = resp["message"]["content"]
-    # DeepSeek-R1 wraps its chain-of-thought in <think> blocks — strip before returning
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     return text
 
@@ -581,7 +571,7 @@ def weekly_reflection():
             activity_summary=activity_lines[:2000],
             behavior_summary=behavior_text,
         )
-        reflection = _llm(REASONING_MODEL, [{"role": "user", "content": prompt}])
+        reflection = _llm(REASONING_MODEL, [{"role": "user", "content": prompt}], system=WEEKLY_REFLECTION_SYSTEM)
 
         # Save conclusions to profile current_context
         from memory import update_profile
@@ -614,7 +604,7 @@ def morning_briefing():
             tasks=tasks_text,
             vault_summary=vault_summary,
         )
-        briefing = _llm(REASONING_MODEL, [{"role": "user", "content": prompt}])
+        briefing = _llm(REASONING_MODEL, [{"role": "user", "content": prompt}], system=MORNING_BRIEFING_SYSTEM)
         _send_telegram(DEFAULT_CHAT_ID, f"☀️ *Briefing matinal*\n\n{briefing}")
         activity.record("morning_briefing", "daily briefing", result=briefing[:200], status="ok")
     except Exception as e:
@@ -674,6 +664,100 @@ def _scan_project_notes():
             log.warning(f"Project scan error: {e}")
 
 
+# ── Multi-step agent ─────────────────────────────────────────────────────────
+
+def _execute_agent_plan(task: str, chat_id: str, user_id: str) -> str:
+    """
+    Plan and execute a multi-step task synchronously.
+    Returns a summary of what was done.
+    """
+    try:
+        note_index = obsidian.get_note_index()
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        prompt = AGENT_PLAN_PROMPT.format(
+            task=task,
+            now=now_str,
+            note_index=note_index[:1000],
+            calendar_available=calendar_integration.is_available(),
+        )
+        raw = _llm(
+            REASONING_MODEL,
+            [{"role": "user", "content": prompt}],
+            system=AGENT_PLAN_SYSTEM.format(max_steps=AGENT_MAX_STEPS),
+        )
+        plan = extract_json(raw)
+        steps = plan.get("steps", [])
+        if not steps:
+            return "Não consegui planejar os passos para essa tarefa."
+
+        results = []
+        _send_telegram(chat_id, f"🤖 *Plano de {len(steps)} passo(s) para:* _{task}_")
+
+        for i, step in enumerate(steps[:AGENT_MAX_STEPS], 1):
+            act = step.get("action", "answer")
+            try:
+                if act == "answer":
+                    results.append(f"Passo {i}: {step.get('reply', '')}")
+                elif act == "search":
+                    sr = web_search(step["query"])
+                    results.append(f"Passo {i} (busca): {sr[:300]}")
+                elif act in ("obsidian_append", "obsidian_create", "obsidian_update", "obsidian_read"):
+                    ok, msg = execute_obsidian_action(step)
+                    results.append(f"Passo {i} ({act}): {msg}")
+                elif act == "schedule_once":
+                    run_at = datetime.fromisoformat(step["run_at"])
+                    sched.add_once(step["message"], chat_id, run_at)
+                    results.append(f"Passo {i}: lembrete agendado para {step['run_at'][:16]}")
+                elif act == "calendar_create" and calendar_integration.is_available():
+                    start_dt = datetime.fromisoformat(step["start"])
+                    calendar_integration.create_event(step["summary"], start_dt)
+                    results.append(f"Passo {i}: evento criado — {step['summary']}")
+                elif act == "delegate_claude":
+                    delegate_to_claude(step["task"], chat_id)
+                    results.append(f"Passo {i}: delegado ao Claude Code")
+                else:
+                    results.append(f"Passo {i} ({act}): ignorado")
+            except Exception as e:
+                results.append(f"Passo {i} ({act}): erro — {e}")
+
+        summary = "\n".join(results)
+        activity.record("agent_plan", task, result=summary[:500], status="ok")
+        return f"✅ *Tarefa concluída em {len(steps)} passo(s):*\n\n{summary}"
+    except Exception as e:
+        log.error(f"Agent plan failed: {e}")
+        return f"❌ Erro ao executar plano: {e}"
+
+
+# ── Contextual project alert ──────────────────────────────────────────────────
+
+def _contextual_project_alert(query: str, chat_id: str):
+    """
+    If the user's message relates to a stale project topic, proactively alert.
+    Runs in background to not delay the chat response.
+    """
+    def _run():
+        try:
+            hits = vault_index.search_similar(obsidian.VAULT, query, top_k=3)
+            if not hits:
+                return
+            projects = _find_project_notes()
+            stale = [p for p in projects if p["age_days"] >= PROJECT_STALE_DAYS and p["open_items"] > 0]
+            for hit in hits:
+                for proj in stale:
+                    if hit["file"] == proj["file"]:
+                        _send_telegram(
+                            chat_id,
+                            f"💡 *Alerta contextual:* você está perguntando sobre `{hit['file']}`, "
+                            f"que tem {proj['open_items']} item(s) aberto(s) há {proj['age_days']} dias.\n"
+                            f"Quer que eu delegue ao Claude Code? Envie `/aprimorar {proj['file']}`"
+                        )
+                        return  # one alert per message is enough
+        except Exception:
+            pass
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 # ── #hermes tag scanner ───────────────────────────────────────────────────────
 
 def _process_hermes_tags():
@@ -694,7 +778,7 @@ def _process_hermes_tags():
                         now=now_str,
                         note_index=note_index,
                     )
-                    raw = _llm(REASONING_MODEL, [{"role": "user", "content": prompt}])
+                    raw = _llm(REASONING_MODEL, [{"role": "user", "content": prompt}], system=HERMES_TAG_SYSTEM)
                     decision = extract_json(raw)
                     reply = decision.pop("reply", f"Processado: {tag['line_text'][:60]}")
 
@@ -720,6 +804,7 @@ def _process_hermes_tags():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _load_histories()
+    conversation_rag.init()
     sched.set_notify_callback(_send_telegram)
     sched.start()
     sched.add_internal_cron(morning_briefing, MORNING_BRIEFING_CRON, "morning_briefing")
@@ -779,6 +864,7 @@ def status():
     last_action = recent[0] if recent else None
     return {
         "status": "ok",
+        "calendar_available": calendar_integration.is_available(),
         "models": {
             "chat":      CHAT_MODEL,
             "intent":    INTENT_MODEL,
@@ -866,7 +952,7 @@ def reflect():
             projects=projects_text,
             tasks=tasks_text,
         )
-        insight = _llm(REASONING_MODEL, [{"role": "user", "content": prompt}])
+        insight = _llm(REASONING_MODEL, [{"role": "user", "content": prompt}], system=REFLECT_SYSTEM)
         activity.record("reflect", "vault reflection", result=insight[:200], status="ok")
         return {"insight": insight, "projects": projects}
     except Exception as e:
@@ -894,6 +980,29 @@ def feedback(req: FeedbackRequest):
 @app.get("/behavior")
 def behavior_summary():
     return learner.get_behavior_summary()
+
+
+@app.get("/calendar/events")
+def calendar_events(days: int = 7):
+    if not calendar_integration.is_available():
+        return {"error": "Google Calendar not configured", "events": []}
+    return {"events": calendar_integration.list_events(days_ahead=days)}
+
+
+@app.post("/calendar/event")
+def calendar_create_event(body: dict):
+    if not calendar_integration.is_available():
+        return {"ok": False, "error": "Google Calendar not configured"}
+    try:
+        start = datetime.fromisoformat(body["start"])
+        end_dt = start + __import__("datetime").timedelta(minutes=body.get("duration_minutes", 60))
+        event = calendar_integration.create_event(
+            summary=body["summary"], start=start, end=end_dt,
+            description=body.get("description", ""),
+        )
+        return {"ok": event is not None, "event": event}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 @app.get("/projects")
@@ -965,7 +1074,7 @@ def chat(req: ChatRequest):
     history = get_history(req.user_id)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
 
-    # Classify intent — qwen2.5:1.5b is more reliable for structured JSON output
+    # Classify intent — hermes3:3b with system message for reliable JSON output
     try:
         decision_raw = _llm(
             INTENT_MODEL,
@@ -973,6 +1082,7 @@ def chat(req: ChatRequest):
                 question=req.message,
                 now=now_str,
             )}],
+            system=DECISION_SYSTEM,
         )
         decision = extract_json(decision_raw)
         action = decision.get("action", "answer")
@@ -1071,6 +1181,50 @@ def chat(req: ChatRequest):
         _save_histories()
         return {"reply": reply, "action": "delegate_claude"}
 
+    # ── Calendar create ────────────────────────────────────────────────────
+    if action == "calendar_create":
+        if not calendar_integration.is_available():
+            reply = "📅 Google Calendar não está configurado. Veja as instruções em `calendar_integration.py`."
+        else:
+            try:
+                start_dt = datetime.fromisoformat(decision.get("start", ""))
+                duration = decision.get("duration_minutes", 60)
+                end_dt = start_dt + __import__("datetime").timedelta(minutes=duration)
+                event = calendar_integration.create_event(
+                    summary=decision.get("summary", req.message),
+                    start=start_dt, end=end_dt,
+                    description=decision.get("description", ""),
+                )
+                reply = f"📅 Evento criado: *{decision.get('summary')}* em {decision.get('start', '')[:16]}" if event else "❌ Falha ao criar evento no calendário."
+            except Exception as e:
+                reply = f"❌ Erro ao criar evento: {e}"
+        history.append({"role": "user", "content": req.message})
+        history.append({"role": "assistant", "content": reply})
+        _save_histories()
+        return {"reply": reply, "action": "calendar_create"}
+
+    # ── Calendar list ──────────────────────────────────────────────────────
+    if action == "calendar_list":
+        if not calendar_integration.is_available():
+            reply = "📅 Google Calendar não está configurado."
+        else:
+            days = decision.get("days", 7)
+            events = calendar_integration.list_events(days_ahead=days)
+            events_text = calendar_integration.format_events_text(events)
+            reply = f"📅 *Próximos eventos ({days} dias):*\n\n{events_text}"
+        history.append({"role": "user", "content": req.message})
+        history.append({"role": "assistant", "content": reply})
+        _save_histories()
+        return {"reply": reply, "action": "calendar_list"}
+
+    # ── Multi-step agent plan ──────────────────────────────────────────────
+    if action == "agent_plan" and decision.get("task"):
+        reply = _execute_agent_plan(decision["task"], req.chat_id, req.user_id)
+        history.append({"role": "user", "content": req.message})
+        history.append({"role": "assistant", "content": reply})
+        _save_histories()
+        return {"reply": reply, "action": "agent_plan"}
+
     # ── Web search ─────────────────────────────────────────────────────────
     search_context = ""
     searched = False
@@ -1091,7 +1245,12 @@ def chat(req: ChatRequest):
         f"[{h['file']}]\n{h['excerpt']}" for h in obsidian_hits
     ) if obsidian_hits else ""
 
-    system = build_system_prompt(obsidian_context)
+    # ── Long-context RAG (past conversations beyond the 20-msg window) ─────
+    past_exchanges = conversation_rag.retrieve(req.user_id, req.message, top_k=2)
+    rag_context = ("\n\nConversas anteriores relevantes:\n" +
+                   "\n---\n".join(past_exchanges)) if past_exchanges else ""
+
+    system = build_system_prompt(obsidian_context + rag_context)
     messages = [{"role": "system", "content": system}]
     messages.extend(list(history))
     messages.append({"role": "user", "content": req.message + search_context})
@@ -1101,6 +1260,13 @@ def chat(req: ChatRequest):
     except Exception as e:
         log.error(f"LLM chat failed: {e}")
         reply = "Desculpe, tive um problema ao processar sua mensagem. Tente novamente."
+
+    # Index this exchange for long-context RAG
+    conversation_rag.index_exchange(req.user_id, req.message, reply)
+
+    # Contextual project alert if vault note related to query is stale
+    if action in ("answer", "search") and obsidian_hits:
+        _contextual_project_alert(req.message, req.chat_id)
 
     # Detect implicit correction before appending new response
     if len(history) >= 2 and learner.is_implicit_correction(req.message):
