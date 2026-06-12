@@ -165,6 +165,7 @@ def search_similar(vault: Path, query: str, top_k: int = 3) -> list[dict]:
     """
     Return top_k semantically similar notes.
     Returns empty list if embedding model is unavailable (caller should fall back to keyword search).
+    Notes accessed are marked for adaptive threshold calculation.
     """
     if not _check_available():
         return []
@@ -181,12 +182,19 @@ def search_similar(vault: Path, query: str, top_k: int = 3) -> list[dict]:
     with _lock:
         items = list(_index.items())
 
+    scores = []
     for rel, data in items:
         emb = data.get("embedding")
         if not emb:
             continue
         score = _cosine(query_emb, emb)
-        if score >= SIMILARITY_THRESHOLD:
+        scores.append((rel, score, data))
+
+    # Adaptive threshold: use dynamic value if we have enough history
+    threshold = _adaptive_threshold() if scores else SIMILARITY_THRESHOLD
+
+    for rel, score, data in scores:
+        if score >= threshold:
             results.append({
                 "file": rel,
                 "path": str(vault / rel),
@@ -195,7 +203,39 @@ def search_similar(vault: Path, query: str, top_k: int = 3) -> list[dict]:
             })
 
     results.sort(key=lambda x: x["score"], reverse=True)
-    return results[:top_k]
+    top = results[:top_k]
+
+    # Bump use_count for returned notes
+    if top:
+        _bump_use_count([r["file"] for r in top])
+
+    return top
+
+
+def _bump_use_count(rels: list[str]):
+    import time
+    with _lock:
+        for rel in rels:
+            if rel in _index:
+                _index[rel]["use_count"] = _index[rel].get("use_count", 0) + 1
+                _index[rel]["last_used"] = time.time()
+    threading.Thread(target=_save, daemon=True).start()
+
+
+def _adaptive_threshold() -> float:
+    """
+    Compute threshold dynamically from the distribution of use_count across notes.
+    Notes accessed more often raise confidence; low-traffic vaults keep default.
+    """
+    with _lock:
+        counts = [v.get("use_count", 0) for v in _index.values()]
+    if not counts or sum(counts) < 10:
+        return SIMILARITY_THRESHOLD
+    # If average use_count > 5, tighten threshold slightly (user has calibrated)
+    avg = sum(counts) / len(counts)
+    if avg > 5:
+        return min(SIMILARITY_THRESHOLD + 0.05, 0.6)
+    return SIMILARITY_THRESHOLD
 
 
 def get_stats() -> dict:

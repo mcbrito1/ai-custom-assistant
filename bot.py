@@ -2,8 +2,9 @@ import os
 import logging
 import threading
 import requests
-from telegram import Bot, Update
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
+from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (ApplicationBuilder, MessageHandler, CommandHandler,
+                           CallbackQueryHandler, filters, ContextTypes)
 from telegram.request import HTTPXRequest
 
 logging.basicConfig(level=logging.INFO)
@@ -67,20 +68,66 @@ async def handle_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"```\n{output}\n```", parse_mode="Markdown")
 
 
+def _feedback_keyboard(action: str, context_snippet: str = "") -> InlineKeyboardMarkup:
+    ctx = context_snippet[:80].replace(":", "")
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("👍", callback_data=f"fb:up:{action}:{ctx}"),
+        InlineKeyboardButton("👎", callback_data=f"fb:down:{action}:{ctx}"),
+    ]])
+
+
+async def handle_feedback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    parts = query.data.split(":", 3)
+    if len(parts) < 3 or parts[0] != "fb":
+        return
+    _, rating, action = parts[0], parts[1], parts[2]
+    ctx = parts[3] if len(parts) > 3 else ""
+    try:
+        requests.post(
+            f"{HERMES_BASE}/feedback",
+            json={"action": action, "context": ctx, "rating": rating},
+            timeout=5,
+        )
+    except Exception:
+        pass
+    label = "Obrigado! 👍" if rating == "up" else "Registrado. Vou melhorar! 👎"
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text(label)
+
+
 async def handle_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
     try:
         resp = requests.get(f"{HERMES_BASE}/memory", timeout=10)
         facts = resp.json().get("facts", [])
+        profile_resp = requests.get(f"{HERMES_BASE}/memory/profile", timeout=10)
+        profile = profile_resp.json().get("profile", {}) if profile_resp.ok else {}
     except Exception as e:
         await update.message.reply_text(f"Erro: {e}")
         return
-    if not facts:
-        await update.message.reply_text("Ainda não aprendi nada sobre você.")
-        return
-    text = "O que eu sei sobre você:\n\n" + "\n".join(f"{i+1}. {f}" for i, f in enumerate(facts))
-    await update.message.reply_text(text)
+
+    lines = []
+    if facts:
+        lines.append("*O que eu sei sobre você:*\n")
+        lines += [f"{i+1}. {f}" for i, f in enumerate(facts)]
+    else:
+        lines.append("Ainda não aprendi fatos sobre você.")
+
+    labels = {"preferences": "Preferências", "projects": "Projetos",
+               "people": "Pessoas", "current_context": "Contexto atual"}
+    has_profile = any(profile.get(cat) for cat in labels)
+    if has_profile:
+        lines.append("\n*Perfil estruturado:*")
+        for cat, label in labels.items():
+            items = profile.get(cat, {})
+            if items:
+                lines.append(f"\n_{label}_")
+                lines += [f"  • {v}" for v in items.values()]
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def handle_remember(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -231,7 +278,10 @@ async def handle_reflect(update: Update, context: ContextTypes.DEFAULT_TYPE):
         insight = data.get("insight", "Sem insights.")
         if len(insight) > 4000:
             insight = insight[:4000] + "\n...(truncado)"
-        await update.message.reply_text(insight)
+        await update.message.reply_text(
+            insight,
+            reply_markup=_feedback_keyboard("reflect", insight[:80]),
+        )
     except Exception as e:
         await update.message.reply_text(f"Erro: {e}")
 
@@ -379,6 +429,7 @@ async def handle_aprimorar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Iterações planejadas: *{data['iterations']}*\n\n"
         f"Te aviso a cada iteração quando concluir.",
         parse_mode="Markdown",
+        reply_markup=_feedback_keyboard("aprimorar", data["note"]),
     )
 
 
@@ -518,5 +569,6 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("projeto", handle_projeto))
     application.add_handler(CommandHandler("aprimorar", handle_aprimorar))
     application.add_handler(CommandHandler("check", handle_check))
+    application.add_handler(CallbackQueryHandler(handle_feedback_callback, pattern=r"^fb:"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.run_polling()
