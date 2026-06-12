@@ -149,7 +149,16 @@ Regras:
 - delegate_claude: código, scripts, refatoração, análise técnica
 - agent_plan: múltiplos passos heterogêneos (pesquisar E criar E agendar)
 - calendar_create/list: eventos no Google Calendar
-- search: pergunta factual sobre o mundo | answer: conversa geral"""
+- search: QUALQUER pergunta sobre fatos do mundo, notícias, datas de eventos, pessoas, lugares, preços, previsão do tempo. Use sempre que o usuário pedir para "pesquisar", "buscar", "procurar" ou fizer uma pergunta factual.
+- answer: APENAS saudações e perguntas sobre o próprio Hermes
+
+Exemplos:
+"Pesquise o primeiro jogo do Brasil na copa" → {"action":"search","query":"primeiro jogo do Brasil na copa do mundo 2026"}
+"Qual a previsão do tempo amanhã?" → {"action":"search","query":"previsão do tempo amanhã"}
+"O que é machine learning?" → {"action":"search","query":"o que é machine learning"}
+"Adicione leite à lista de compras" → {"action":"obsidian_append","note":"lista de compras","content":"leite","is_list_item":true}
+"Me lembre amanhã às 9h" → {"action":"schedule_once","message":"lembrete","run_at":"<ISO8601>"}
+"Olá, como vai?" → {"action":"answer"}"""
 
 DECISION_PROMPT = "Data/hora: {now}\nMensagem: {question}"
 
@@ -1091,6 +1100,16 @@ def chat(req: ChatRequest):
         log.error(f"Intent classification failed: {e}")
         action = "answer"
         decision = {}
+
+    # Keyword-based search override — catches misclassifications when model falls back to gemma2
+    _SEARCH_SIGNALS = ("pesquise", "pesquisar", "busque", "buscar", "procure", "procurar",
+                       "o que é", "o que são", "quem é", "quando é", "quando foi",
+                       "qual é", "quais são", "como funciona", "onde fica", "notícia",
+                       "previsão do tempo", "cotação", "preço de")
+    if action == "answer" and any(s in req.message.lower() for s in _SEARCH_SIGNALS):
+        action = "search"
+        decision = {"action": "search", "query": req.message}
+        log.debug("Search override triggered by keyword match.")
 
     # ── Obsidian read ──────────────────────────────────────────────────────
     if action == "obsidian_read":
