@@ -3,12 +3,13 @@
 ## Overview
 
 Hermes é um **secretário virtual autônomo** rodando em Docker, conectado a:
-- **Ollama** (host.docker.internal:11434) com modelo `gemma2:2b` (cérebro principal)
-- **Claude Code** via `host_agent.py` (delegação de tarefas técnicas complexas)
+- **Ollama** (host.docker.internal:11434) — multi-model routing (hermes3:3b, gemma2:2b, qwen2.5-coder:1.5b, nomic-embed-text)
+- **Claude Code** via `host/host_agent.py` (delegação de tarefas técnicas complexas)
 - **Telegram** para interface conversacional
 - **Obsidian** vault em `C:\Git\Obsidian` (leitura/escrita/indexação semântica + git sync)
 - **Windows host** via host_agent.py na porta 9000 (PowerShell + Claude CLI)
 - **APScheduler** para agendamento de tarefas e jobs autônomos
+- **Google Calendar** via OAuth2
 
 ---
 
@@ -16,25 +17,41 @@ Hermes é um **secretário virtual autônomo** rodando em Docker, conectado a:
 
 ```
 C:\Git\Hermes\
-├── main.py              # FastAPI agent (chat, intent classification, autonomous jobs)
-├── bot.py              # Telegram bot with command handlers
-├── obsidian.py         # Vault read/write + #hermes tag scanner + index trigger
-├── vault_index.py      # Semantic embeddings (nomic-embed-text) + cosine search
-├── memory.py           # Persistent facts + structured profile + system prompt builder
-├── scheduler.py        # APScheduler (cron + one-time + internal system jobs)
-├── activity.py         # Activity log for delegations and autonomous actions
-├── host_agent.py       # Standalone HTTP server on host (PowerShell + Claude CLI)
-├── start_host_agent.bat # Auto-start wrapper
-├── Dockerfile          # Python 3.12-slim + curl + git
-├── docker-compose.yml  # Two services: hermes (agent) + hermes-bot (telegram)
-├── requirements.txt    # Python dependencies
-├── .env               # Config (NEVER commit this!)
-├── .gitignore         # Excludes .env, data/, __pycache__
-├── data/              # Persistent: memory.json, tasks.json, history.json,
-│                      #   vault_index.json, activity_log.json, backups/
-└── README.md          # User-facing docs
+├── app/                     # Python application (→ /app/ no container)
+│   ├── main.py              # FastAPI agent: chat, intent, jobs, endpoints
+│   ├── bot.py               # Telegram bot: command handlers, feedback inline
+│   ├── memory.py            # Fatos persistentes + perfil estruturado + system prompt
+│   ├── obsidian.py          # Vault read/write + #hermes tag scanner + git sync
+│   ├── vault_index.py       # Embeddings semânticos (nomic-embed-text) + busca cosine
+│   ├── learner.py           # Aprendizado autônomo: comportamento, feedback, dedup semântico
+│   ├── conversation_rag.py  # RAG de conversas: embede trocas, recupera contexto longo
+│   ├── calendar_integration.py  # Google Calendar OAuth2: criar/listar eventos
+│   ├── activity.py          # Log de delegações e ações autônomas
+│   ├── scheduler.py         # APScheduler: cron + one-time + jobs internos
+│   └── whatsapp.py          # WhatsApp (on hold — branch feat/waha-whatsapp)
+├── host/                    # Windows host (não entra no container)
+│   ├── host_agent.py        # HTTP server :9000 — PowerShell + Claude CLI
+│   └── start_host_agent.bat # Auto-start wrapper (coloque no Startup do Windows)
+├── data/                    # Dados persistentes (bind mount ./data:/app/data, gitignored)
+│   ├── memory.json          # Fatos + perfil do usuário
+│   ├── tasks.json           # Lembretes agendados
+│   ├── history.json         # Histórico de conversa por user_id
+│   ├── vault_index.json     # Índice semântico do vault
+│   ├── activity_log.json    # Log de ações autônomas
+│   ├── behavior.json        # Padrões de uso (learner)
+│   ├── conversation_index.json  # RAG de conversas
+│   ├── google_credentials.json  # OAuth2 credentials (não commitado)
+│   ├── google_token.json    # OAuth2 token (não commitado)
+│   └── backups/             # Snapshots semanais
+├── Dockerfile               # python:3.12-slim; COPY app/ . (não COPY . .)
+├── docker-compose.yml       # Dois services: hermes (agent :8000) + hermes-bot
+├── requirements.txt         # Python dependencies
+├── .env                     # Config (NEVER commit!)
+├── .gitignore               # Exclui .env, data/, __pycache__
+├── CLAUDE.md                # Este arquivo
+└── README.md                # Documentação do usuário
 
-C:\Git\Obsidian/      # User's knowledge base (git-synced)
+C:\Git\Obsidian/      # Knowledge base do usuário (git-synced)
 C:\Git\waha-rikin/    # WhatsApp WAHA client (feat/waha-whatsapp branch only)
 ```
 
@@ -43,259 +60,244 @@ C:\Git\waha-rikin/    # WhatsApp WAHA client (feat/waha-whatsapp branch only)
 ## Key Design Decisions
 
 ### 1. **Branching Strategy**
-- **master**: Production code. No WhatsApp integration. Clean, minimal.
-- **feat/waha-whatsapp**: WhatsApp via waha-rikin (on hold). Preserved for future evaluation.
+- **master**: Código de produção. Sem WhatsApp.
+- **feat/waha-whatsapp**: Integração WhatsApp via waha-rikin (on hold).
 
-### 2. **Obsidian Sync Pattern**
-- **Every read** calls `git pull --rebase --autostash` (rate-limited to 60s cooldown)
-- **Every write** calls `git add -A && git commit && git push`
-- This ensures the vault stays in sync across devices/sessions
-- **Requirement**: `C:\Git\Obsidian` must be a git repo with a configured remote and accessible credentials (SSH key or credential helper)
+### 2. **Multi-Model Routing**
 
-### 3. **Persistent Memory**
-- `/app/data/memory.json`: User facts extracted from conversation
-- `/app/data/tasks.json`: Scheduled reminders (one-time + recurring)
-- Both mounted via bind volume `./data:/app/data` for portability (not Docker named volumes)
+| Constante | Modelo padrão | Papel |
+|---|---|---|
+| `CHAT_MODEL` | `gemma2:2b` | Conversas em português |
+| `INTENT_MODEL` | `hermes3:3b` | Classificação de intent (JSON via ChatML system message) |
+| `REASONING_MODEL` | `hermes3:3b` | Análise, reflexão, briefing, extração de fatos |
+| `CODE_MODEL` | `qwen2.5-coder:1.5b` | Contexto para pipeline /aprimorar |
+| EMBED_MODEL (env) | `nomic-embed-text` | Embeddings para vault index + conversation RAG |
 
-### 4. **Intent Classification**
-- No tool-use API calls (gemma2:2b doesn't support them)
-- Instead: LLM-based classification with regex JSON extraction
-- Actions: `search`, `schedule_once`, `schedule_recurring`, `obsidian_append`, `obsidian_create`, `answer`
+`_llm(model, messages, fallback=CHAT_MODEL, system=None)` — aceita `system=` para injetar system message no formato ChatML do hermes3. Fallback automático para `CHAT_MODEL` se o modelo não estiver disponível.
 
-### 5. **Corporate SSL Proxy**
-- httpx with `verify=False` for Telegram Bot API (corporate cert interception)
-- pip with `--trusted-host` in Dockerfile RUN command
-- This is intentional and only safe within a controlled corporate environment
+Todos os prompts para INTENT_MODEL e REASONING_MODEL são divididos em:
+- `*_SYSTEM`: instrução fixa (schema JSON, regras) → passa como `system=`
+- `*_PROMPT`: dados dinâmicos (mensagem, conversa, contexto) → passa como `user`
 
-### 6. **#hermes Tag Scanner**
-- Background thread scans vault every 60s for lines with `#hermes` (but not `#hermes/done`)
-- Auto-processes via LLM, executes actions (append, create, schedule), marks as done
-- Notifies user via Telegram upon completion
-- Run `/hermestags` in Telegram to see pending actions
+### 3. **Obsidian Sync Pattern**
+- **Toda leitura**: `git pull --rebase --autostash` (rate-limited a 60s de cooldown)
+- **Toda escrita**: `git add -A && git commit && git push`
+- **Requisito**: `C:\Git\Obsidian` deve ser um repo git com remote e credenciais configuradas
 
-### 7. **Host Execution**
-- `host_agent.py` runs standalone on Windows host port 9000
-- Secured via `X-Agent-Secret` header (change the default secret!)
-- Spawns PowerShell subprocesses; replaces `claude ` prefix with full path to `claude.cmd`
-- Started via `start_host_agent.bat` in Windows Startup folder
+### 4. **Persistent Memory**
+- `memory.json`: fatos como objetos `{text, added_at, last_used_at, use_count, stale}`
+- `tasks.json`: lembretes one-time e recorrentes
+- `behavior.json`: padrões de uso (intents por hora/dia, notas acessadas, feedback)
+- `conversation_index.json`: embeddings de conversas para RAG (cap 500 entradas)
+- Todos montados via bind volume `./data:/app/data`
+- Perfil sincronizado para `Hermes/Perfil.md` no vault após cada update
 
----
+### 5. **Intent Classification**
+Sem tool-use API (hermes3 via Ollama não expõe essa interface da mesma forma).
+Classificação via LLM com `system=DECISION_SYSTEM` (schema JSON explícito) e extração por regex.
 
-## Important Security Notes
+Actions disponíveis:
+- `obsidian_append`, `obsidian_create`, `obsidian_read`, `obsidian_update`
+- `schedule_once`, `schedule_recurring`
+- `delegate_claude`
+- `agent_plan` (multi-step)
+- `calendar_create`, `calendar_list`
+- `search`
+- `answer`
 
-### Credentials & Secrets
-- **TELEGRAM_TOKEN**: Real token in `.env` (DO NOT commit). Revoke via @BotFather if exposed.
-- **HOST_AGENT_SECRET**: Set to production-grade secret before deployment. Current default: `hermes-secret-mude-isso`
-- **SSH/Git credentials**: Ensure `C:\Git\Obsidian` remote has valid credentials. Use SSH keys or credential helper, not plaintext passwords.
-- **.env is in .gitignore**: `git add .env` will be blocked by auto-mode. Never force-add it.
+### 6. **Sistema de Aprendizado (learner.py)**
+- `record_behavior(intent, notes_used, action_status)` — chamado a cada `/chat`
+- `record_feedback(context, rating, action)` — 👍/👎 via botões inline Telegram
+- `record_correction(original, correction)` — detecta "na verdade", "não é isso", etc.
+- `deduplicate_facts_semantic(facts)` — cosine > 0.92 → fato duplicado removido
+- `classify_facts_into_profile(facts, llm_fn)` — categoriza em preferences/projects/people/current_context
+- Dados em `behavior.json`
 
-### SSL Verification
-- Disabled (`verify=False`) for Telegram + WAHA due to corporate proxy
-- **Only safe in a controlled, monitored corporate environment**
-- Before deploying elsewhere, restore SSL verification or use proper certificate handling
+### 7. **Conversation RAG (conversation_rag.py)**
+- `index_exchange(user_id, user_msg, assistant_msg)` — embede e persiste cada troca
+- `retrieve(user_id, query, top_k=3, min_score=0.5)` — recupera trocas antigas relevantes
+- Ignora as últimas 20 entradas (já na janela de contexto ativa)
+- Cap de 500 entradas em `conversation_index.json`
 
----
+### 8. **Google Calendar (calendar_integration.py)**
+- OAuth2 via `google-auth`; token salvo em `google_token.json`
+- `is_available()` — fallback gracioso se credentials não configurados
+- Setup: baixar `credentials.json` do Google Console → salvar em `data/google_credentials.json`
 
-## Development Workflow
+### 9. **#hermes Tag Scanner**
+- Thread background: varre vault a cada `HERMES_TAG_SCAN_INTERVAL` segundos
+- Linhas com `#hermes` (sem `#hermes/done`) → processa via REASONING_MODEL → executa → marca done
+- Notifica via Telegram
 
-### 1. **Local Changes to Code**
-```bash
-cd C:\Git\Hermes
-# Edit files (main.py, bot.py, obsidian.py, etc.)
-docker compose up -d --build   # Rebuild and restart
-docker logs hermes-agent        # Verify startup
-```
+### 10. **Host Execution**
+- `host/host_agent.py` roda standalone na porta 9000 do Windows host
+- Seguro via `X-Agent-Secret` header (mude o padrão!)
+- Spawna subprocessos PowerShell; substitui `claude ` pelo caminho completo de `claude.cmd`
 
-### 2. **Updating Obsidian Vault**
-- Push changes from any device to the remote
-- Next time Hermes reads the vault, it will pull automatically
-- Any write triggers a commit + push
-
-### 3. **Adding Python Dependencies**
-```bash
-# Edit requirements.txt
-docker compose up -d --build
-```
-
-### 4. **Changing Ollama Model**
-```bash
-# In .env:
-OLLAMA_MODEL=llama2  # or any model available on host
-docker compose restart hermes
-```
-
-### 5. **Debugging**
-- **Chat endpoint**: POST http://localhost:8000/chat
-- **Health check**: GET http://localhost:8000/health
-- **Telegram logs**: `docker logs hermes-bot`
-- **Hermes logs**: `docker logs hermes-agent`
-- **Memory check**: GET http://localhost:8000/memory
-- **Pending tasks**: GET http://localhost:8000/tasks
-- **#hermes tags**: GET http://localhost:8000/obsidian/hermes-tags
+### 11. **Corporate SSL Proxy**
+- `verify=False` em httpx para Telegram Bot API e host agent
+- `--trusted-host` no Dockerfile para pip
+- Intencional — apenas em ambiente corporativo controlado
 
 ---
-
-## User-Facing Features
-
-### Telegram Commands
-| Command | Purpose |
-|---|---|
-| `/run <PowerShell cmd>` | Execute command on Windows host |
-| `/delegate <task>` | Delegate task directly to Claude Code |
-| `/aprimorar <nota>` | Run improvement pipeline on a project note |
-| `/projeto <nome>` | Show project note details (open items, activity) |
-| `/projects` | List all project notes (#projeto) with status |
-| `/reflect` | Vault analysis — insights, stale projects, suggestions |
-| `/status` | Agent status panel (model, index, tasks, uptime) |
-| `/activity [n]` | Show last N delegations and autonomous actions |
-| `/memory` | View learned facts about user |
-| `/remember <fact>` | Manually add a fact |
-| `/notes <search>` | Search Obsidian vault (semantic + keyword fallback) |
-| `/obsidian [name]` | List all notes or search |
-| `/hermestags` | Show pending #hermes tags |
-| `/tasks` | List scheduled reminders |
-| `/cancel <id>` | Cancel a task |
-
-### Chat Features
-- **Web search**: "O que é machine learning?" → searches DuckDuckGo automatically
-- **One-time tasks**: "Lembrete amanhã às 10h para fazer café"
-- **Recurring tasks**: "Me lembrar todo dia às 8h de fazer exercício" (cron generation)
-- **Obsidian append**: "Adicione chocolate à minha lista de compras"
-- **Obsidian create**: "Crie uma nota de ideias para o projeto X"
-
-### Obsidian Integration
-Mark lines in notes with `#hermes` to trigger actions:
-```markdown
-- [ ] Comprar pão #hermes
-- Me ligar amanhã 15h #hermes
-#hermes criar nota de retrospectiva da semana
-```
-Hermes will process automatically every 60s, execute, and mark as `#hermes/done`.
-
----
-
-## Future Directions (Hold/Backlog)
-
-1. **WhatsApp via waha-rikin**: Branch `feat/waha-whatsapp` has full integration. Pending: user evaluation and credential setup.
-2. **Larger models**: Currently using gemma2:2b for speed. Can upgrade to llama2, llama3, or others on the host.
-3. **Vision**: Could add image upload support if a vision model is available on Ollama.
-4. **Slack integration**: Parallel to Telegram.
-
----
-
-## When Something Breaks
-
-### Hermes won't start
-```bash
-docker logs hermes-agent
-# Check: Ollama reachable? host.docker.internal resolves?
-docker exec hermes-agent curl http://host.docker.internal:11434/api/tags
-```
-
-### Git pull/push fails
-```bash
-# Inside the container
-docker exec hermes-agent bash
-cd /obsidian && git status
-# Check: SSH keys? Remote URL correct?
-```
-
-### Telegram bot not responding
-```bash
-docker logs hermes-bot
-# Check: TELEGRAM_TOKEN in docker-compose.yml?
-# Token expires after ~40 days; may need refresh via @BotFather
-```
-
-### #hermes tags not scanning
-- Check HERMES_TAG_SCAN_INTERVAL in .env (default 60s)
-- Ensure vault has write permissions in container
-- Watch logs: `docker logs hermes-agent | grep hermes`
-
----
-
-## Code Style & Patterns
-
-- **No comments on WHAT**: Good variable names + function signatures are enough
-- **Comments on WHY**: Hidden constraints, workarounds, non-obvious invariants
-- **Imports organized**: stdlib, third-party, local modules
-- **Error handling at boundaries**: Validate input, trust internal code
-- **Logging**: Use `logging` module, not print()
-- **Type hints**: Use them when they clarify intent
-- **Regex extraction**: `extract_json()` pattern used throughout for LLM outputs
-
----
-
-## Testing & Deployment
-
-- **No automated tests yet**: Manual testing via Telegram preferred for now
-- **Pre-deployment checks**:
-  1. `docker logs hermes-agent` — no errors
-  2. `docker logs hermes-bot` — no errors
-  3. Send a test message to Hermes in Telegram
-  4. Test `/obsidian` command
-  5. Test `/run pwd` command
-  6. Verify memory extraction: `/memory` after a few messages
-  7. Check pending tasks: `/tasks`
-
----
-
-## Useful Commands
-
-```bash
-# View all container info
-docker compose ps
-docker compose logs -f hermes-agent
-
-# Rebuild from scratch
-docker compose down && docker compose up -d --build
-
-# Remove all stopped containers and dangling images
-docker system prune
-
-# Check if Ollama is reachable from container
-docker exec hermes-agent curl http://host.docker.internal:11434/api/tags
-
-# Full restart (keeps data)
-docker compose restart
-
-# See what's in persistent data
-ls -la C:\Git\Hermes\data\
-
-# Change Telegram token (never commit it!)
-# 1. Get new token via @BotFather /newbot
-# 2. Update .env
-# 3. docker compose restart
-```
-
----
-
-## Contact & Support
-
-- **Owner ID for Telegram commands**: 449989534 (guards /run, /memory, /tasks, etc.)
-- **Config file**: `.env` (never commit)
-- **Logs location**: Docker container logs (use `docker logs <container>`)
-- **Obsidian repo**: Must be a valid git repo with remote for sync to work
-
----
-
-## Escalada Gemma → Claude Code
-
-O `gemma2:2b` é o cérebro para classificação de intents, conversas e operações simples no vault.
-
-Escala automaticamente para Claude Code quando:
-- Tarefa envolve escrever/refatorar código
-- Scripts, automações, ou análise multi-arquivo
-- Intent `delegate_claude` detectado no classificador
-- Comando `/delegate` ou `/aprimorar` enviado manualmente
 
 ## Autonomous Jobs (APScheduler)
 
 | Job | Cron | Função |
 |---|---|---|
-| Briefing matinal | `0 8 * * *` | Resume vault + tarefas do dia |
-| Scanner de projetos | a cada 1h | Alerta sobre #projeto com itens parados |
-| Backup semanal | `0 3 * * 0` | Snapshot de data/ em data/backups/ |
+| Briefing matinal | `0 8 * * *` | Resume vault + tarefas do dia via REASONING_MODEL |
+| Reflexão semanal | `0 22 * * 6` | Analisa últimos 7 dias, salva em profile, envia ao Telegram |
+| Scanner de projetos | a cada 1h | Alerta sobre `#projeto` com itens parados > PROJECT_STALE_DAYS |
+| Backup semanal | `0 3 * * 0` | Snapshot de `data/` em `data/backups/` |
 | #hermes tags | a cada 60s | Processa ações marcadas no vault |
 
-**Last Updated**: 2026-06-11
+---
+
+## Telegram Commands (Referência Completa)
+
+| Comando | Função |
+|---|---|
+| `/check` | Verifica todos os circuitos (Ollama, vault, calendar, scheduler, host agent) |
+| `/status` | Painel: modelos, índice, tarefas, uptime |
+| `/memory` | Fatos aprendidos + perfil estruturado |
+| `/remember <fato>` | Adiciona fato manualmente |
+| `/notes <busca>` | Busca semântica no vault |
+| `/obsidian [nome]` | Lista ou busca notas |
+| `/hermestags` | Tags `#hermes` pendentes |
+| `/reflect` | Análise do vault (timeout 600s) |
+| `/projects` | Lista notas `#projeto` com status |
+| `/projeto <nome>` | Detalhe de projeto (itens abertos, atividade) |
+| `/aprimorar <nota>` | Pipeline de melhoria via Claude Code |
+| `/delegate <tarefa>` | Delegação direta ao Claude Code |
+| `/run <cmd>` | PowerShell no host Windows |
+| `/activity [n]` | Últimas N ações autônomas |
+| `/tasks` | Lembretes agendados |
+| `/cancel <id>` | Cancela lembrete |
+| `/agenda [days]` | Eventos Google Calendar |
+
+---
+
+## API Endpoints (FastAPI :8000)
+
+| Endpoint | Método | Descrição |
+|---|---|---|
+| `/chat` | POST | Chat principal |
+| `/health` | GET | Health check (usado pelo Docker healthcheck) |
+| `/status` | GET | Status completo |
+| `/memory` | GET | Fatos do usuário |
+| `/memory/profile` | GET | Perfil estruturado |
+| `/reflect` | GET | Reflexão do vault |
+| `/activity` | GET | Log de atividades |
+| `/feedback` | POST | Registrar 👍/👎 |
+| `/behavior` | GET | Resumo de padrões de uso |
+| `/projects` | GET | Lista projetos |
+| `/projects/improve` | POST | Iniciar pipeline /aprimorar |
+| `/projects/detail` | GET | Detalhe de projeto |
+| `/calendar/events` | GET | Listar eventos |
+| `/calendar/event` | POST | Criar evento |
+| `/tasks` | GET | Lembretes |
+| `/obsidian/hermes-tags` | GET | Tags pendentes |
+
+---
+
+## Development Workflow
+
+### Alterar código Python
+```bash
+cd C:\Git\Hermes
+# Edite arquivos em app/
+docker compose up -d --build
+docker logs hermes-agent
+```
+
+### Adicionar dependência Python
+```bash
+# Edite requirements.txt
+docker compose up -d --build
+```
+
+### Trocar modelo Ollama
+```bash
+# No .env:
+OLLAMA_MODEL=llama3.2
+docker compose restart hermes
+```
+
+### Debug
+```bash
+docker logs hermes-agent -f
+docker logs hermes-bot -f
+curl http://localhost:8000/health
+curl http://localhost:8000/status
+```
+
+### Testar via API
+```bash
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Olá Hermes!", "user_id": "test", "chat_id": "test"}'
+```
+
+---
+
+## Security Notes
+
+- **TELEGRAM_TOKEN**: token real em `.env` (NÃO commitar). Revogar via @BotFather se exposto.
+- **HOST_AGENT_SECRET**: mude `hermes-secret-mude-isso` antes de produção.
+- **google_credentials.json** e **google_token.json**: ficam em `data/` (gitignored).
+- **SSL disabled**: `verify=False` para Telegram + host agent — intencional em ambiente corporativo.
+- `.env` está no `.gitignore` — nunca force-add.
+
+---
+
+## Code Style & Patterns
+
+- **Sem comentários óbvios**: nomes de variáveis e funções são suficientes
+- **Comentários no WHY**: constraints ocultas, workarounds, invariantes
+- **`extract_json(text)`**: extrai o primeiro objeto JSON via regex — usado em todos os outputs LLM
+- **`_llm(model, messages, fallback, system=)`**: wrapper central com fallback e strip de `<think>` blocks
+- **`_with_retry(fn, *args, attempts, backoff)`**: retry com backoff exponencial
+- **Logging**: `logging` module, não `print()`
+- **Type hints**: quando clarificam a intenção
+- **Threads**: operações de I/O (vault, LLM, Telegram) em `threading.Thread(daemon=True)`
+
+---
+
+## When Something Breaks
+
+### Agent não inicia
+```bash
+docker logs hermes-agent
+docker exec hermes-agent curl http://host.docker.internal:11434/api/tags
+```
+
+### Git pull/push falha
+```bash
+docker exec hermes-agent bash
+cd /obsidian && git status
+```
+
+### Bot não responde
+```bash
+docker logs hermes-bot
+# Token expirado? → @BotFather /revoke
+```
+
+### /run não funciona
+```bash
+# No host Windows:
+netstat -ano | findstr 9000
+# Se não estiver rodando:
+# Execute host\start_host_agent.bat
+```
+
+### Modelos não disponíveis
+```bash
+# No host Windows:
+ollama pull hermes3:3b
+ollama pull nomic-embed-text
+```
+
+---
+
+**Last Updated**: 2026-06-12
