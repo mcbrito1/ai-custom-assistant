@@ -12,11 +12,14 @@ from contextlib import asynccontextmanager
 from pydantic import BaseModel
 import ollama
 from duckduckgo_search import DDGS
-from memory import build_system_prompt, add_fact, get_facts, search_obsidian, update_profile
+from memory import (build_system_prompt, add_fact, get_facts, search_obsidian,
+                     update_profile, add_facts_bulk, replace_facts,
+                     update_profile_from_classified, mark_stale_facts)
 import obsidian
 import vault_index
 import scheduler as sched
 import activity
+import learner
 
 OLLAMA_HOST = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
 
@@ -42,7 +45,8 @@ HERMES_TAG_SCAN_INTERVAL = int(os.getenv("HERMES_TAG_SCAN_INTERVAL", "60"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 HISTORY_FILE = os.getenv("HISTORY_FILE", "/app/data/history.json")
 MORNING_BRIEFING_CRON = os.getenv("MORNING_BRIEFING_CRON", "0 8 * * *")
-BACKUP_CRON = os.getenv("BACKUP_CRON", "0 3 * * 0")  # Sundays at 3am
+BACKUP_CRON = os.getenv("BACKUP_CRON", "0 3 * * 0")
+WEEKLY_REFLECTION_CRON = os.getenv("WEEKLY_REFLECTION_CRON", "0 22 * * 6")  # Saturdays at 22h
 PROJECT_SCAN_INTERVAL = int(os.getenv("PROJECT_SCAN_INTERVAL", "3600"))  # seconds
 PROJECT_STALE_DAYS = int(os.getenv("PROJECT_STALE_DAYS", "7"))
 MAX_IMPROVE_ITERATIONS = int(os.getenv("MAX_IMPROVE_ITERATIONS", "2"))
@@ -147,12 +151,29 @@ REGRAS:
 
 Retorne APENAS o JSON."""
 
-EXTRACT_FACTS_PROMPT = """Extraia fatos duradouros sobre o usuário desta conversa (nome, profissão, projetos, hábitos).
+EXTRACT_FACTS_PROMPT = """Extraia fatos duradouros sobre o usuário desta conversa (nome, profissão, projetos, hábitos, preferências).
 Retorne APENAS JSON: {{"facts": ["fato 1", "fato 2"]}}
 Se não houver fatos novos: {{"facts": []}}
 
 Conversa:
 {conversation}"""
+
+WEEKLY_REFLECTION_PROMPT = """Você é o Hermes fazendo uma reflexão semanal sobre seu desempenho.
+
+Atividades dos últimos 7 dias:
+{activity_summary}
+
+Padrões de comportamento do usuário:
+{behavior_summary}
+
+Analise e responda em português:
+1. O que funcionou bem esta semana?
+2. O que falhou ou foi ineficiente?
+3. Quais padrões de uso você identificou?
+4. O que você faria diferente na próxima semana?
+5. Alguma sugestão proativa para o usuário?
+
+Seja direto e acionável. Máximo 300 palavras."""
 
 MORNING_BRIEFING_PROMPT = """Você é o Hermes. Prepare um briefing matinal conciso para o usuário.
 
@@ -248,24 +269,47 @@ def web_search(query: str, max_results: int = 5) -> str:
 
 
 def extract_and_save_facts(user_id: str):
+    """Extract facts every 4 messages, deduplicate semantically, classify into profile."""
     history = get_history(user_id)
-    if len(history) < 2:
+    if len(history) < 2 or len(history) % 4 != 0:
         return
+
     conversation = "\n".join(
         f"{'Usuário' if m['role'] == 'user' else 'Hermes'}: {m['content']}"
-        for m in history
+        for m in list(history)[-12:]
     )
-    try:
-        raw = _llm(
-            REASONING_MODEL,
-            [{"role": "user", "content": EXTRACT_FACTS_PROMPT.format(conversation=conversation)}],
-        )
-        data = extract_json(raw)
-        for fact in data.get("facts", []):
-            if fact and len(fact) > 5:
-                add_fact(fact)
-    except Exception as e:
-        log.warning(f"Fact extraction failed: {e}")
+
+    def _run():
+        try:
+            raw = _llm(
+                REASONING_MODEL,
+                [{"role": "user", "content": EXTRACT_FACTS_PROMPT.format(conversation=conversation)}],
+            )
+            new_facts = [f for f in extract_json(raw).get("facts", []) if f and len(f) > 5]
+            if not new_facts:
+                return
+
+            added = add_facts_bulk(new_facts)
+            if added:
+                log.info(f"Extracted {added} new fact(s).")
+
+            # Semantic dedup across all stored facts
+            from memory import get_facts_rich
+            all_texts = [f["text"] for f in get_facts_rich()]
+            deduped = learner.deduplicate_facts_semantic(all_texts)
+            if len(deduped) < len(all_texts):
+                replace_facts(deduped)
+
+            # Auto-populate profile categories
+            classified = learner.classify_facts_into_profile(deduped, _llm)
+            if classified:
+                update_profile_from_classified(classified)
+
+            mark_stale_facts()
+        except Exception as e:
+            log.warning(f"Fact extraction pipeline failed: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 # ── Obsidian write actions ────────────────────────────────────────────────────
@@ -512,6 +556,43 @@ def backup_data():
         log.error(f"Backup failed: {e}")
 
 
+# ── Weekly self-reflection ────────────────────────────────────────────────────
+
+def weekly_reflection():
+    """Analyze last 7 days of activity and behavior. Send insights to Telegram."""
+    log.info("Running weekly self-reflection…")
+    try:
+        recent = activity.get_recent(50)
+        activity_lines = "\n".join(
+            f"- {e['ts']} | {e['action']} | {e['status']} | {e['prompt'][:60]}"
+            for e in recent
+        ) or "Nenhuma atividade registrada."
+
+        behavior = learner.get_behavior_summary()
+        top_intents = ", ".join(f"{k}({v})" for k, v in behavior.get("top_intents", []))
+        behavior_text = (
+            f"Interações totais: {behavior.get('total_interactions', 0)}\n"
+            f"Intents mais frequentes: {top_intents or 'N/A'}\n"
+            f"Hora de pico: {behavior.get('peak_hour', 'N/A')}h\n"
+            f"Correções registradas: {behavior.get('correction_count', 0)}"
+        )
+
+        prompt = WEEKLY_REFLECTION_PROMPT.format(
+            activity_summary=activity_lines[:2000],
+            behavior_summary=behavior_text,
+        )
+        reflection = _llm(REASONING_MODEL, [{"role": "user", "content": prompt}])
+
+        # Save conclusions to profile current_context
+        from memory import update_profile
+        update_profile("current_context", "weekly_reflection", reflection[:500])
+
+        _send_telegram(DEFAULT_CHAT_ID, f"🧠 *Reflexão semanal do Hermes*\n\n{reflection}")
+        activity.record("weekly_reflection", "self-analysis", result=reflection[:200], status="ok")
+    except Exception as e:
+        log.error(f"Weekly reflection failed: {e}")
+
+
 # ── Morning briefing ─────────────────────────────────────────────────────────
 
 def morning_briefing():
@@ -643,6 +724,7 @@ async def lifespan(app: FastAPI):
     sched.start()
     sched.add_internal_cron(morning_briefing, MORNING_BRIEFING_CRON, "morning_briefing")
     sched.add_internal_cron(backup_data, BACKUP_CRON, "weekly_backup")
+    sched.add_internal_cron(weekly_reflection, WEEKLY_REFLECTION_CRON, "weekly_reflection")
     threading.Thread(target=_process_hermes_tags, daemon=True).start()
     threading.Thread(target=_scan_project_notes, daemon=True).start()
     threading.Thread(
@@ -717,6 +799,12 @@ def memory():
     return {"facts": get_facts()}
 
 
+@app.get("/memory/profile")
+def memory_profile():
+    from memory import get_profile
+    return {"profile": get_profile()}
+
+
 @app.post("/memory/add")
 def memory_add(body: dict):
     fact = body.get("fact", "").strip()
@@ -789,6 +877,23 @@ def reflect():
 @app.get("/activity")
 def activity_log(n: int = 10):
     return {"entries": activity.get_recent(n)}
+
+
+class FeedbackRequest(BaseModel):
+    action: str
+    context: str = ""
+    rating: str  # "up" or "down"
+
+
+@app.post("/feedback")
+def feedback(req: FeedbackRequest):
+    learner.record_feedback(req.context, req.rating, req.action)
+    return {"ok": True}
+
+
+@app.get("/behavior")
+def behavior_summary():
+    return learner.get_behavior_summary()
 
 
 @app.get("/projects")
@@ -997,11 +1102,20 @@ def chat(req: ChatRequest):
         log.error(f"LLM chat failed: {e}")
         reply = "Desculpe, tive um problema ao processar sua mensagem. Tente novamente."
 
+    # Detect implicit correction before appending new response
+    if len(history) >= 2 and learner.is_implicit_correction(req.message):
+        last_response = history[-1]["content"] if history else ""
+        learner.record_correction(last_response, req.message)
+        log.info("Implicit correction detected and recorded.")
+
     history.append({"role": "user", "content": req.message})
     history.append({"role": "assistant", "content": reply})
 
-    if len(history) % 8 == 0:
-        extract_and_save_facts(req.user_id)
+    # Record behavior pattern for this interaction
+    notes_used = [h["file"] for h in obsidian_hits] if obsidian_hits else []
+    learner.record_behavior(action, notes_used=notes_used)
+
+    extract_and_save_facts(req.user_id)
 
     _save_histories()
     log.info(f"Reply to user={req.user_id}: {reply[:80]}")
