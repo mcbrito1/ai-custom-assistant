@@ -181,18 +181,14 @@ def is_implicit_correction(message: str) -> bool:
 
 # ── Smart fact extraction ────────────────────────────────────────────────────
 
-PROFILE_CLASSIFY_PROMPT = """Classifique cada fato em uma das categorias e retorne JSON.
-
-Fatos: {facts}
-
-Categorias:
+PROFILE_CLASSIFY_SYSTEM = """Classifique fatos em categorias e retorne APENAS JSON.
+Schema: {"preferences": [...], "projects": [...], "people": [...], "current_context": [...]}
 - preferences: gostos, hábitos, preferências pessoais
 - projects: projetos em andamento ou planejados
-- people: pessoas mencionadas (família, colegas, amigos)
-- current_context: situação atual, emprego, localização, fase de vida
+- people: pessoas mencionadas
+- current_context: situação atual, emprego, localização, fase de vida"""
 
-Retorne APENAS JSON:
-{{"preferences": ["..."], "projects": ["..."], "people": ["..."], "current_context": ["..."]}}"""
+PROFILE_CLASSIFY_PROMPT = "Fatos:\n{facts}"
 
 FACT_STALE_CHECK_PROMPT = """Analise estes fatos e identifique quais provavelmente ainda são verdadeiros.
 Considere que fatos antigos sobre projetos, emprego e contexto mudam; gostos e características pessoais são mais estáveis.
@@ -215,7 +211,11 @@ def classify_facts_into_profile(facts: list[str], llm_fn) -> dict:
         import re
         from main import REASONING_MODEL, extract_json
         prompt = PROFILE_CLASSIFY_PROMPT.format(facts="\n".join(f"- {f}" for f in facts))
-        raw = llm_fn(REASONING_MODEL, [{"role": "user", "content": prompt}])
+        raw = llm_fn(
+            REASONING_MODEL,
+            [{"role": "user", "content": prompt}],
+            system=PROFILE_CLASSIFY_SYSTEM,
+        )
         return extract_json(raw)
     except Exception as e:
         log.warning(f"Profile classification failed: {e}")
