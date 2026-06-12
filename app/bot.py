@@ -565,6 +565,53 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(reply)
 
 
+async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "🤖 *Hermes — Assistente Virtual*\n\n"
+        "Fale comigo em português! Entendo linguagem natural para agendar lembretes, "
+        "buscar informações, gerenciar suas notas no Obsidian e muito mais.\n\n"
+
+        "*📋 Comandos disponíveis*\n\n"
+
+        "*Diagnóstico*\n"
+        "/check — Verifica todos os circuitos \\(Ollama, vault, calendário…\\)\n"
+        "/status — Painel: modelos ativos, índice, tarefas, uptime\n\n"
+
+        "*Memória e Aprendizado*\n"
+        "/memory — Fatos que aprendi sobre você \\+ perfil estruturado\n"
+        "/remember \\<fato\\> — Ensina um fato novo manualmente\n\n"
+
+        "*Vault Obsidian*\n"
+        "/notes \\<busca\\> — Busca semântica nas suas notas\n"
+        "/obsidian — Lista todas as notas\n"
+        "/hermestags — Tags `#hermes` pendentes de processamento\n"
+        "/reflect — Análise do vault: projetos parados, sugestões\n\n"
+
+        "*Projetos*\n"
+        "/projects — Lista notas `#projeto` com status\n"
+        "/projeto \\<nome\\> — Detalhe de um projeto\n"
+        "/aprimorar \\<nota\\> — Melhora o projeto via Claude Code\n\n"
+
+        "*Delegação e Execução*\n"
+        "/delegate \\<tarefa\\> — Delega ao Claude Code\n"
+        "/run \\<cmd\\> — Executa PowerShell no Windows\n"
+        "/activity — Últimas ações autônomas\n\n"
+
+        "*Agendamento e Calendário*\n"
+        "/tasks — Lembretes agendados\n"
+        "/cancel \\<id\\> — Cancela um lembrete\n"
+        "/agenda \\[dias\\] — Eventos do Google Calendar\n\n"
+
+        "*💬 Exemplos de uso direto*\n"
+        "• _Adicione leite à lista de compras_\n"
+        "• _Me lembre amanhã às 9h de ligar para o médico_\n"
+        "• _Pesquise o primeiro jogo do Brasil na copa_\n"
+        "• _Crie uma nota chamada Ideias de Projeto_\n"
+        "• _Refatora o arquivo main\\.py_ → delega ao Claude Code"
+    )
+    await update.message.reply_text(text, parse_mode="MarkdownV2")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -614,50 +661,3 @@ if __name__ == "__main__":
     application.add_handler(CallbackQueryHandler(handle_feedback_callback, pattern=r"^fb:"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.run_polling()
-
-
-async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "🤖 *Hermes — Assistente Virtual*\n\n"
-        "Fale comigo em português! Entendo linguagem natural para agendar lembretes, "
-        "buscar informações, gerenciar suas notas no Obsidian e muito mais.\n\n"
-
-        "*📋 Comandos disponíveis*\n\n"
-
-        "*Diagnóstico*\n"
-        "/check — Verifica todos os circuitos \\(Ollama, vault, calendário…\\)\n"
-        "/status — Painel: modelos ativos, índice, tarefas, uptime\n\n"
-
-        "*Memória e Aprendizado*\n"
-        "/memory — Fatos que aprendi sobre você \\+ perfil estruturado\n"
-        "/remember \\<fato\\> — Ensina um fato novo manualmente\n\n"
-
-        "*Vault Obsidian*\n"
-        "/notes \\<busca\\> — Busca semântica nas suas notas\n"
-        "/obsidian — Lista todas as notas\n"
-        "/hermestags — Tags `#hermes` pendentes de processamento\n"
-        "/reflect — Análise do vault: projetos parados, sugestões\n\n"
-
-        "*Projetos*\n"
-        "/projects — Lista notas `#projeto` com status\n"
-        "/projeto \\<nome\\> — Detalhe de um projeto\n"
-        "/aprimorar \\<nota\\> — Melhora o projeto via Claude Code\n\n"
-
-        "*Delegação e Execução*\n"
-        "/delegate \\<tarefa\\> — Delega ao Claude Code\n"
-        "/run \\<cmd\\> — Executa PowerShell no Windows\n"
-        "/activity — Últimas ações autônomas\n\n"
-
-        "*Agendamento e Calendário*\n"
-        "/tasks — Lembretes agendados\n"
-        "/cancel \\<id\\> — Cancela um lembrete\n"
-        "/agenda \\[dias\\] — Eventos do Google Calendar\n\n"
-
-        "*💬 Exemplos de uso direto*\n"
-        "• _Adicione leite à lista de compras_\n"
-        "• _Me lembre amanhã às 9h de ligar para o médico_\n"
-        "• _Pesquise o primeiro jogo do Brasil na copa_\n"
-        "• _Crie uma nota chamada Ideias de Projeto_\n"
-        "• _Refatora o arquivo main\\.py_ → delega ao Claude Code"
-    )
-    await update.message.reply_text(text, parse_mode="MarkdownV2")
