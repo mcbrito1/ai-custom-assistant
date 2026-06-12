@@ -17,7 +17,7 @@ RUN pip install --no-cache-dir \
     -r requirements.txt
 
 # Copy application code
-COPY . .
+COPY app/ .
 
 # Configure git for commits inside container
 RUN git config --global user.email "hermes@localhost" && \
