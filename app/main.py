@@ -67,6 +67,10 @@ client = ollama.Client(host=OLLAMA_HOST)
 _histories: dict[str, deque] = {}
 _HISTORY_LOCK = threading.Lock()
 
+# Pending delegations awaiting user confirmation — keyed by short ID
+import uuid as _uuid
+_pending_delegations: dict[str, dict] = {}
+
 
 # ── Conversation history persistence ─────────────────────────────────────────
 
@@ -1023,6 +1027,25 @@ def feedback(req: FeedbackRequest):
     return {"ok": True}
 
 
+class DelegationConfirmRequest(BaseModel):
+    delegation_id: str
+
+
+@app.post("/delegate/confirm")
+def delegate_confirm(req: DelegationConfirmRequest):
+    pending = _pending_delegations.pop(req.delegation_id, None)
+    if not pending:
+        return {"ok": False, "error": "Delegação não encontrada ou já processada."}
+    delegate_to_claude(pending["task"], pending["chat_id"], context=pending.get("vault_ctx", ""))
+    return {"ok": True}
+
+
+@app.post("/delegate/cancel")
+def delegate_cancel(req: DelegationConfirmRequest):
+    _pending_delegations.pop(req.delegation_id, None)
+    return {"ok": True}
+
+
 @app.get("/behavior")
 def behavior_summary():
     return learner.get_behavior_summary()
@@ -1223,19 +1246,19 @@ def chat(req: ChatRequest):
         _save_histories()
         return {"reply": reply, "action": "schedule_recurring"}
 
-    # ── Delegate to Claude Code ────────────────────────────────────────────
+    # ── Delegate to Claude Code (requires user confirmation) ──────────────
     if action == "delegate_claude" and decision.get("task"):
-        # Attach top relevant vault notes as context
         vault_hits = vault_index.search_similar(obsidian.VAULT, decision["task"], top_k=2)
         if not vault_hits:
             vault_hits = obsidian.search_notes(decision["task"], max_results=2)
         vault_ctx = "\n\n".join(f"[{h['file']}]\n{h['excerpt']}" for h in vault_hits)
-        delegate_to_claude(decision["task"], req.chat_id, context=vault_ctx)
-        reply = "🤖 Tarefa enviada ao Claude Code! Te aviso quando terminar."
+        del_id = _uuid.uuid4().hex[:12]
+        _pending_delegations[del_id] = {"task": decision["task"], "chat_id": req.chat_id, "vault_ctx": vault_ctx}
+        reply = f"🤖 *Delegar ao Claude Code:*\n```\n{decision['task'][:400]}\n```\nConfirmar?"
         history.append({"role": "user", "content": req.message})
         history.append({"role": "assistant", "content": reply})
         _save_histories()
-        return {"reply": reply, "action": "delegate_claude"}
+        return {"reply": reply, "action": "delegate_claude", "delegation_id": del_id}
 
     # ── Calendar create ────────────────────────────────────────────────────
     if action == "calendar_create":

@@ -80,6 +80,26 @@ async def handle_feedback_callback(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
     parts = query.data.split(":", 3)
+
+    # Delegation confirmation: del:confirm:<id> or del:cancel:<id>
+    if parts[0] == "del" and len(parts) >= 3:
+        action, del_id = parts[1], parts[2]
+        await query.edit_message_reply_markup(reply_markup=None)
+        if action == "confirm":
+            try:
+                requests.post(f"{HERMES_BASE}/delegate/confirm", json={"delegation_id": del_id}, timeout=10)
+                await query.message.reply_text("✅ Delegação confirmada! Te aviso quando o Claude Code terminar.")
+            except Exception as e:
+                await query.message.reply_text(f"❌ Erro ao confirmar delegação: {e}")
+        else:
+            try:
+                requests.post(f"{HERMES_BASE}/delegate/cancel", json={"delegation_id": del_id}, timeout=5)
+            except Exception:
+                pass
+            await query.message.reply_text("❌ Delegação cancelada.")
+        return
+
+    # Feedback: fb:up/down:action:ctx
     if len(parts) < 3 or parts[0] != "fb":
         return
     _, rating, action = parts[0], parts[1], parts[2]
@@ -559,10 +579,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             json={"message": user_text, "user_id": user_id, "chat_id": chat_id},
             timeout=120,
         )
-        reply = resp.json().get("reply", "Sem resposta.")
+        data = resp.json()
+        reply = data.get("reply", "Sem resposta.")
+        del_id = data.get("delegation_id")
     except Exception as e:
         reply = f"Erro: {e}"
-    await update.message.reply_text(reply)
+        del_id = None
+
+    if del_id:
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Confirmar", callback_data=f"del:confirm:{del_id}"),
+            InlineKeyboardButton("❌ Cancelar", callback_data=f"del:cancel:{del_id}"),
+        ]])
+        await update.message.reply_text(reply, reply_markup=keyboard, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(reply)
 
 
 async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
