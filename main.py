@@ -20,6 +20,8 @@ import vault_index
 import scheduler as sched
 import activity
 import learner
+import conversation_rag
+import calendar_integration
 
 OLLAMA_HOST = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
 
@@ -46,8 +48,9 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 HISTORY_FILE = os.getenv("HISTORY_FILE", "/app/data/history.json")
 MORNING_BRIEFING_CRON = os.getenv("MORNING_BRIEFING_CRON", "0 8 * * *")
 BACKUP_CRON = os.getenv("BACKUP_CRON", "0 3 * * 0")
-WEEKLY_REFLECTION_CRON = os.getenv("WEEKLY_REFLECTION_CRON", "0 22 * * 6")  # Saturdays at 22h
-PROJECT_SCAN_INTERVAL = int(os.getenv("PROJECT_SCAN_INTERVAL", "3600"))  # seconds
+WEEKLY_REFLECTION_CRON = os.getenv("WEEKLY_REFLECTION_CRON", "0 22 * * 6")
+PROJECT_SCAN_INTERVAL = int(os.getenv("PROJECT_SCAN_INTERVAL", "3600"))
+AGENT_MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "5"))
 PROJECT_STALE_DAYS = int(os.getenv("PROJECT_STALE_DAYS", "7"))
 MAX_IMPROVE_ITERATIONS = int(os.getenv("MAX_IMPROVE_ITERATIONS", "2"))
 RETRY_ATTEMPTS = int(os.getenv("RETRY_ATTEMPTS", "3"))
@@ -136,6 +139,9 @@ EXEMPLOS:
 "Refatora o arquivo main.py" → {{"action":"delegate_claude","task":"Refatora o arquivo main.py"}}
 "Cria um script Python para renomear arquivos" → {{"action":"delegate_claude","task":"Cria um script Python para renomear arquivos"}}
 "O que é Docker?" → {{"action":"search","query":"O que é Docker"}}
+"Agende uma reunião amanhã às 14h sobre o projeto X" → {{"action":"calendar_create","summary":"Reunião sobre projeto X","start":"2026-06-13T14:00","duration_minutes":60}}
+"Quais eventos tenho esta semana?" → {{"action":"calendar_list","days":7}}
+"Pesquise sobre IA, crie uma nota e agende uma revisão" → {{"action":"agent_plan","task":"Pesquise sobre IA, crie uma nota e agende uma revisão"}}
 "Olá, como vai?" → {{"action":"answer"}}
 
 REGRAS:
@@ -145,7 +151,10 @@ REGRAS:
 - obsidian_update: sobrescrever/editar conteúdo de nota existente
 - schedule_once: lembrete com data/hora específica
 - schedule_recurring: lembrete que se repete (todo dia, toda semana)
+- calendar_create: criar evento no Google Calendar
+- calendar_list: listar próximos eventos do calendário
 - delegate_claude: qualquer tarefa técnica (código, scripts, análise de projetos, refatoração)
+- agent_plan: tarefas complexas com múltiplos passos (pesquisar E criar nota E agendar, etc.)
 - search: perguntas factuais sobre o mundo
 - answer: conversa geral
 
@@ -157,6 +166,26 @@ Se não houver fatos novos: {{"facts": []}}
 
 Conversa:
 {conversation}"""
+
+AGENT_PLAN_PROMPT = """Você é o Hermes. O usuário pediu uma tarefa que requer múltiplas etapas.
+Quebre em passos simples e retorne APENAS JSON.
+
+Tarefa: {task}
+Data/hora: {now}
+Notas disponíveis: {note_index}
+Google Calendar disponível: {calendar_available}
+
+Retorne uma lista de até {max_steps} passos, cada um com a ação a executar:
+{{"steps": [
+  {{"action": "search", "query": "..."}},
+  {{"action": "obsidian_create", "note": "...", "content": "..."}},
+  {{"action": "schedule_once", "message": "...", "run_at": "ISO8601"}},
+  {{"action": "calendar_create", "summary": "...", "start": "ISO8601"}},
+  {{"action": "delegate_claude", "task": "..."}},
+  {{"action": "answer", "reply": "..."}}
+]}}
+
+Cada passo deve ser independente e executável. Máximo {max_steps} passos."""
 
 WEEKLY_REFLECTION_PROMPT = """Você é o Hermes fazendo uma reflexão semanal sobre seu desempenho.
 
@@ -674,6 +703,97 @@ def _scan_project_notes():
             log.warning(f"Project scan error: {e}")
 
 
+# ── Multi-step agent ─────────────────────────────────────────────────────────
+
+def _execute_agent_plan(task: str, chat_id: str, user_id: str) -> str:
+    """
+    Plan and execute a multi-step task synchronously.
+    Returns a summary of what was done.
+    """
+    try:
+        note_index = obsidian.get_note_index()
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        prompt = AGENT_PLAN_PROMPT.format(
+            task=task,
+            now=now_str,
+            note_index=note_index[:1000],
+            calendar_available=calendar_integration.is_available(),
+            max_steps=AGENT_MAX_STEPS,
+        )
+        raw = _llm(REASONING_MODEL, [{"role": "user", "content": prompt}])
+        plan = extract_json(raw)
+        steps = plan.get("steps", [])
+        if not steps:
+            return "Não consegui planejar os passos para essa tarefa."
+
+        results = []
+        _send_telegram(chat_id, f"🤖 *Plano de {len(steps)} passo(s) para:* _{task}_")
+
+        for i, step in enumerate(steps[:AGENT_MAX_STEPS], 1):
+            act = step.get("action", "answer")
+            try:
+                if act == "answer":
+                    results.append(f"Passo {i}: {step.get('reply', '')}")
+                elif act == "search":
+                    sr = web_search(step["query"])
+                    results.append(f"Passo {i} (busca): {sr[:300]}")
+                elif act in ("obsidian_append", "obsidian_create", "obsidian_update", "obsidian_read"):
+                    ok, msg = execute_obsidian_action(step)
+                    results.append(f"Passo {i} ({act}): {msg}")
+                elif act == "schedule_once":
+                    run_at = datetime.fromisoformat(step["run_at"])
+                    sched.add_once(step["message"], chat_id, run_at)
+                    results.append(f"Passo {i}: lembrete agendado para {step['run_at'][:16]}")
+                elif act == "calendar_create" and calendar_integration.is_available():
+                    start_dt = datetime.fromisoformat(step["start"])
+                    calendar_integration.create_event(step["summary"], start_dt)
+                    results.append(f"Passo {i}: evento criado — {step['summary']}")
+                elif act == "delegate_claude":
+                    delegate_to_claude(step["task"], chat_id)
+                    results.append(f"Passo {i}: delegado ao Claude Code")
+                else:
+                    results.append(f"Passo {i} ({act}): ignorado")
+            except Exception as e:
+                results.append(f"Passo {i} ({act}): erro — {e}")
+
+        summary = "\n".join(results)
+        activity.record("agent_plan", task, result=summary[:500], status="ok")
+        return f"✅ *Tarefa concluída em {len(steps)} passo(s):*\n\n{summary}"
+    except Exception as e:
+        log.error(f"Agent plan failed: {e}")
+        return f"❌ Erro ao executar plano: {e}"
+
+
+# ── Contextual project alert ──────────────────────────────────────────────────
+
+def _contextual_project_alert(query: str, chat_id: str):
+    """
+    If the user's message relates to a stale project topic, proactively alert.
+    Runs in background to not delay the chat response.
+    """
+    def _run():
+        try:
+            hits = vault_index.search_similar(obsidian.VAULT, query, top_k=3)
+            if not hits:
+                return
+            projects = _find_project_notes()
+            stale = [p for p in projects if p["age_days"] >= PROJECT_STALE_DAYS and p["open_items"] > 0]
+            for hit in hits:
+                for proj in stale:
+                    if hit["file"] == proj["file"]:
+                        _send_telegram(
+                            chat_id,
+                            f"💡 *Alerta contextual:* você está perguntando sobre `{hit['file']}`, "
+                            f"que tem {proj['open_items']} item(s) aberto(s) há {proj['age_days']} dias.\n"
+                            f"Quer que eu delegue ao Claude Code? Envie `/aprimorar {proj['file']}`"
+                        )
+                        return  # one alert per message is enough
+        except Exception:
+            pass
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 # ── #hermes tag scanner ───────────────────────────────────────────────────────
 
 def _process_hermes_tags():
@@ -720,6 +840,7 @@ def _process_hermes_tags():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _load_histories()
+    conversation_rag.init()
     sched.set_notify_callback(_send_telegram)
     sched.start()
     sched.add_internal_cron(morning_briefing, MORNING_BRIEFING_CRON, "morning_briefing")
@@ -779,6 +900,7 @@ def status():
     last_action = recent[0] if recent else None
     return {
         "status": "ok",
+        "calendar_available": calendar_integration.is_available(),
         "models": {
             "chat":      CHAT_MODEL,
             "intent":    INTENT_MODEL,
@@ -894,6 +1016,29 @@ def feedback(req: FeedbackRequest):
 @app.get("/behavior")
 def behavior_summary():
     return learner.get_behavior_summary()
+
+
+@app.get("/calendar/events")
+def calendar_events(days: int = 7):
+    if not calendar_integration.is_available():
+        return {"error": "Google Calendar not configured", "events": []}
+    return {"events": calendar_integration.list_events(days_ahead=days)}
+
+
+@app.post("/calendar/event")
+def calendar_create_event(body: dict):
+    if not calendar_integration.is_available():
+        return {"ok": False, "error": "Google Calendar not configured"}
+    try:
+        start = datetime.fromisoformat(body["start"])
+        end_dt = start + __import__("datetime").timedelta(minutes=body.get("duration_minutes", 60))
+        event = calendar_integration.create_event(
+            summary=body["summary"], start=start, end=end_dt,
+            description=body.get("description", ""),
+        )
+        return {"ok": event is not None, "event": event}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 @app.get("/projects")
@@ -1071,6 +1216,50 @@ def chat(req: ChatRequest):
         _save_histories()
         return {"reply": reply, "action": "delegate_claude"}
 
+    # ── Calendar create ────────────────────────────────────────────────────
+    if action == "calendar_create":
+        if not calendar_integration.is_available():
+            reply = "📅 Google Calendar não está configurado. Veja as instruções em `calendar_integration.py`."
+        else:
+            try:
+                start_dt = datetime.fromisoformat(decision.get("start", ""))
+                duration = decision.get("duration_minutes", 60)
+                end_dt = start_dt + __import__("datetime").timedelta(minutes=duration)
+                event = calendar_integration.create_event(
+                    summary=decision.get("summary", req.message),
+                    start=start_dt, end=end_dt,
+                    description=decision.get("description", ""),
+                )
+                reply = f"📅 Evento criado: *{decision.get('summary')}* em {decision.get('start', '')[:16]}" if event else "❌ Falha ao criar evento no calendário."
+            except Exception as e:
+                reply = f"❌ Erro ao criar evento: {e}"
+        history.append({"role": "user", "content": req.message})
+        history.append({"role": "assistant", "content": reply})
+        _save_histories()
+        return {"reply": reply, "action": "calendar_create"}
+
+    # ── Calendar list ──────────────────────────────────────────────────────
+    if action == "calendar_list":
+        if not calendar_integration.is_available():
+            reply = "📅 Google Calendar não está configurado."
+        else:
+            days = decision.get("days", 7)
+            events = calendar_integration.list_events(days_ahead=days)
+            events_text = calendar_integration.format_events_text(events)
+            reply = f"📅 *Próximos eventos ({days} dias):*\n\n{events_text}"
+        history.append({"role": "user", "content": req.message})
+        history.append({"role": "assistant", "content": reply})
+        _save_histories()
+        return {"reply": reply, "action": "calendar_list"}
+
+    # ── Multi-step agent plan ──────────────────────────────────────────────
+    if action == "agent_plan" and decision.get("task"):
+        reply = _execute_agent_plan(decision["task"], req.chat_id, req.user_id)
+        history.append({"role": "user", "content": req.message})
+        history.append({"role": "assistant", "content": reply})
+        _save_histories()
+        return {"reply": reply, "action": "agent_plan"}
+
     # ── Web search ─────────────────────────────────────────────────────────
     search_context = ""
     searched = False
@@ -1091,7 +1280,12 @@ def chat(req: ChatRequest):
         f"[{h['file']}]\n{h['excerpt']}" for h in obsidian_hits
     ) if obsidian_hits else ""
 
-    system = build_system_prompt(obsidian_context)
+    # ── Long-context RAG (past conversations beyond the 20-msg window) ─────
+    past_exchanges = conversation_rag.retrieve(req.user_id, req.message, top_k=2)
+    rag_context = ("\n\nConversas anteriores relevantes:\n" +
+                   "\n---\n".join(past_exchanges)) if past_exchanges else ""
+
+    system = build_system_prompt(obsidian_context + rag_context)
     messages = [{"role": "system", "content": system}]
     messages.extend(list(history))
     messages.append({"role": "user", "content": req.message + search_context})
@@ -1101,6 +1295,13 @@ def chat(req: ChatRequest):
     except Exception as e:
         log.error(f"LLM chat failed: {e}")
         reply = "Desculpe, tive um problema ao processar sua mensagem. Tente novamente."
+
+    # Index this exchange for long-context RAG
+    conversation_rag.index_exchange(req.user_id, req.message, reply)
+
+    # Contextual project alert if vault note related to query is stale
+    if action in ("answer", "search") and obsidian_hits:
+        _contextual_project_alert(req.message, req.chat_id)
 
     # Detect implicit correction before appending new response
     if len(history) >= 2 and learner.is_implicit_correction(req.message):

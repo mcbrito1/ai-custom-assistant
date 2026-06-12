@@ -41,6 +41,48 @@ def _save(data: dict):
     path.parent.mkdir(parents=True, exist_ok=True)
     data["updated_at"] = datetime.utcnow().isoformat()
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    # Persist profile to vault asynchronously so it survives container rebuilds
+    import threading
+    threading.Thread(target=_sync_to_vault, args=(data,), daemon=True).start()
+
+
+def _sync_to_vault(data: dict):
+    """Write a human-readable Hermes/Perfil.md note to the Obsidian vault."""
+    try:
+        import obsidian as obs
+        vault = obs.VAULT
+        hermes_dir = vault / "Hermes"
+        hermes_dir.mkdir(exist_ok=True)
+        profile_path = hermes_dir / "Perfil.md"
+
+        facts = [f["text"] if isinstance(f, dict) else f for f in data.get("facts", [])]
+        profile = data.get("profile", {})
+        updated = data.get("updated_at", "")[:19]
+
+        lines = [
+            "# Perfil do Usuário — Hermes",
+            f"_Atualizado em: {updated}_",
+            "",
+            "## Fatos aprendidos",
+        ]
+        for f in facts:
+            lines.append(f"- {f}")
+
+        labels = {"preferences": "Preferências", "projects": "Projetos",
+                  "people": "Pessoas", "current_context": "Contexto atual"}
+        for cat, label in labels.items():
+            items = profile.get(cat, {})
+            if items:
+                lines.append(f"\n## {label}")
+                for v in items.values():
+                    lines.append(f"- {v}")
+
+        content = "\n".join(lines) + "\n"
+        profile_path.write_text(content, encoding="utf-8")
+        obs.git_push("hermes: sync profile to vault")
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).debug(f"Vault profile sync failed: {e}")
 
 
 # ── Flat facts API (backwards compat — returns text strings) ──────────────────
